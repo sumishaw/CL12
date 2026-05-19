@@ -280,18 +280,7 @@ class SpeechCaptureService : Service() {
                                 audioQueue.poll(); audioQueue.offer(job)
                                 Log.d(TAG, "Queue full — dropped oldest")
                             }
-
-                            // FIX 2: Warm-up language lock on first chunk
-                            // Queue same chunk ×2 extra so server sees 3 identical
-                            // chunks and locks the language before displaying anything.
-                            if (chunksSentThisSession.incrementAndGet() == 1) {
-                                repeat(2) {
-                                    if (!audioQueue.offer(AudioJob(wav, stampMs))) {
-                                        audioQueue.poll(); audioQueue.offer(AudioJob(wav, stampMs))
-                                    }
-                                }
-                                Log.d(TAG, "Language warm-up: first chunk queued ×3")
-                            }
+                            chunksSentThisSession.incrementAndGet()
                         }
                         filled = 0
                     }
@@ -392,7 +381,6 @@ class SpeechCaptureService : Service() {
 
             if (alive) {
                 consecutiveErrors.set(0); reconnecting = false; reconnectBackoffMs = 2_000L
-                chunksSentThisSession.set(0) // reset warm-up after reconnect
                 mainHandler.post {
                     updateNotification("Translating video audio to Hindi…")
                     OverlayService.updateText("", "✓ Reconnected — listening…")
