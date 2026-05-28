@@ -9,43 +9,18 @@ import android.graphics.Typeface
 import android.os.*
 import android.util.TypedValue
 import android.view.*
+import android.view.animation.AlphaAnimation
+import android.view.animation.TranslateAnimation
+import android.view.animation.AnimationSet
 import android.widget.*
 import androidx.core.app.NotificationCompat
 
 /**
- * OverlayService — REWRITTEN v4
+ * OverlayService — Rolling subtitle display (like Live Captions)
  *
- * ROOT CAUSES FIXED:
- *
- * FIX 1 — SENTENCES/WORDS DROPPED BY BAD DEDUP:
- *   Old code: words.indexOfLast { it == lastQueued }
- *   If the last word in the queue happened to match ANY word in the new sentence
- *   (e.g. common Hindi words "है", "का", "में", "और"), everything before that
- *   match was silently skipped. For a 10-word sentence, 8 words could be dropped.
- *   Fix: Dedup completely removed. Every translation is shown in full, no word
- *   skipping. The IDENTICAL-text check in SpeechCaptureService already prevents
- *   true duplicates from being sent.
- *
- * FIX 2 — READING PAUSE REPLACES CONTENT:
- *   Old code: During 3s reading pause, new translations replaced the wordQueue
- *   entirely. If 2 translations arrived during the pause (normal at 2s chunks),
- *   the first was lost completely.
- *   Fix: Reading pause removed entirely. Text is shown instantly as a full
- *   sentence, cleared after DISPLAY_MS, then next sentence shown. No word-by-word
- *   ticker — it was the source of timing bugs and lost words.
- *
- * FIX 3 — WORD-BY-WORD TICKER CAUSED DISPLAY GAPS:
- *   Revealing 55ms/word meant a 12-word sentence took 660ms to fully appear.
- *   During that 660ms, a new translation could arrive and corrupt/replace the
- *   queue mid-display. Fast dialogue (Bollywood 5-7 words/sec) was impossible.
- *   Fix: Full sentence displayed instantly. No ticker. No queue corruption.
- *
- * NEW DISPLAY MODEL:
- *   Each translation is shown as complete text immediately.
- *   After DISPLAY_MS (2500ms) it fades and is replaced by the next one.
- *   If a new translation arrives before DISPLAY_MS, it replaces immediately.
- *   Source text shown above Hindi text in smaller grey font.
- *   Silence for SILENCE_MS (5s) fades the overlay out.
+ * Shows up to 3 lines of Hindi subtitles.
+ * New line appears at bottom, old lines scroll up and fade out.
+ * Mimics exactly how Live Captions displays text.
  */
 class OverlayService : Service() {
 
@@ -55,7 +30,6 @@ class OverlayService : Service() {
 
         @Volatile var latestOriginal = ""
         @Volatile var latestHindi    = ""
-
         @Volatile private var pushCallback: ((String, String) -> Unit)? = null
 
         fun updateText(original: String, hindi: String) {
@@ -65,30 +39,36 @@ class OverlayService : Service() {
         }
     }
 
-    // Subtitle stays visible for 8s or until next subtitle arrives.
-    // Previous 3.5s was too short — with 10s processing time between
-    // subtitles, text disappeared before the next one arrived.
-    private val DISPLAY_MS = 8_000L
-    // Fade out after 10s of silence
-    private val SILENCE_MS = 10_000L
+    // Max lines to show at once (like Live Captions)
+    private val MAX_LINES    = 3
+    // How long each line stays before fading (ms)
+    private val LINE_LIFE_MS = 6_000L
+    // Fade out after silence (ms)
+    private val SILENCE_MS   = 8_000L
 
     private var windowManager: WindowManager?              = null
     private var overlayView:   View?                       = null
-    private var srcTv:         TextView?                   = null   // source language text
-    private var hindiTv:       TextView?                   = null   // Hindi translation
-    private var params:        WindowManager.LayoutParams? = null
+    private var linesContainer: LinearLayout?              = null
+    private var params:         WindowManager.LayoutParams? = null
     private val mainHandler    = Handler(Looper.getMainLooper())
 
     @Volatile private var running   = true
     @Volatile private var viewAdded = false
-    @Volatile private var isVisible = false
 
-    private var displayRunnable:  Runnable? = null
-    private var silenceRunnable:  Runnable? = null
+    // Rolling subtitle lines — newest last
+    private val subtitleLines = ArrayDeque<String>()
+    private val lineViews = mutableListOf<TextView>()
+
+    private var silenceRunnable: Runnable? = null
+    private var lastHindi = ""
 
     private fun dp(v: Int) = TypedValue.applyDimension(
         TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics
     ).toInt()
+
+    private fun sp(v: Float) = TypedValue.applyDimension(
+        TypedValue.COMPLEX_UNIT_SP, v, resources.displayMetrics
+    )
 
     override fun onCreate() {
         super.onCreate()
@@ -124,101 +104,155 @@ class OverlayService : Service() {
     }
 
     private fun onNewText(original: String, hindi: String) {
-        // Only show Hindi translation — never show English/source language text
-        // If translation failed (hindi is blank), show nothing rather than English
         if (hindi.isBlank()) return
+        if (hindi == lastHindi) return
+        lastHindi = hindi
 
-        displayRunnable?.let { mainHandler.removeCallbacks(it) }
-        silenceRunnable?.let { mainHandler.removeCallbacks(it) }
-
-        srcTv?.text   = ""
-        hindiTv?.text = hindi.trim()
-
-        showOverlay()
+        addSubtitleLine(hindi.trim())
         rescheduleSilence()
-
-        displayRunnable = Runnable {
-            srcTv?.text   = ""
-            hindiTv?.text = ""
-        }
-        mainHandler.postDelayed(displayRunnable!!, DISPLAY_MS)
     }
 
-    private fun showOverlay() {
-        if (!isVisible) {
-            overlayView?.apply {
-                alpha = 0f
-                animate().alpha(1f).setDuration(120).start()
+    // ── Rolling subtitle logic ─────────────────────────────────────────────────
+
+    private fun addSubtitleLine(text: String) {
+        val container = linesContainer ?: return
+
+        // Add new line to our data
+        subtitleLines.addLast(text)
+
+        // Keep only MAX_LINES
+        while (subtitleLines.size > MAX_LINES) {
+            subtitleLines.removeFirst()
+        }
+
+        // Rebuild the visual display
+        rebuildLines(container)
+    }
+
+    private fun rebuildLines(container: LinearLayout) {
+        // Remove all existing views with slide-up animation for old ones
+        val existingViews = (0 until container.childCount).map { container.getChildAt(it) }
+
+        // Animate existing lines sliding up slightly
+        existingViews.forEach { view ->
+            view.animate()
+                .translationY(-dp(4).toFloat())
+                .alpha(if (subtitleLines.size >= MAX_LINES) 0f else 1f)
+                .setDuration(150)
+                .withEndAction {
+                    container.removeAllViews()
+                    addLineViews(container)
+                }
+                .start()
+        }
+
+        // If container is empty, add directly
+        if (existingViews.isEmpty()) {
+            addLineViews(container)
+        }
+    }
+
+    private fun addLineViews(container: LinearLayout) {
+        container.removeAllViews()
+
+        subtitleLines.forEachIndexed { index, text ->
+            val isNewest = index == subtitleLines.size - 1
+            val isOldest = index == 0 && subtitleLines.size == MAX_LINES
+
+            val tv = TextView(this).apply {
+                this.text = text
+                typeface  = Typeface.DEFAULT_BOLD
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, if (isNewest) 22f else 18f)
+                setTextColor(when {
+                    isNewest -> Color.WHITE          // newest — full white
+                    isOldest -> Color.parseColor("#99FFFFFF")  // oldest — 60% opacity
+                    else     -> Color.parseColor("#CCFFFFFF")  // middle — 80% opacity
+                })
+                setShadowLayer(10f, 0f, 2f, Color.BLACK)
+                setPadding(0, dp(2), 0, dp(2))
+                maxLines  = 2
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                // Background pill for newest line (like Live Captions)
+                if (isNewest) {
+                    setBackgroundResource(0)
+                    background = createRoundedBackground()
+                    setPadding(dp(10), dp(6), dp(10), dp(6))
+                }
             }
-            isVisible = true
-        } else {
-            // Already visible — ensure full opacity (in case fade-out was in progress)
-            overlayView?.animate()?.cancel()
-            overlayView?.alpha = 1f
+
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = dp(if (isNewest) 0 else 2)
+            }
+            container.addView(tv, lp)
+
+            // Animate newest line sliding in from bottom
+            if (isNewest) {
+                tv.translationY = dp(20).toFloat()
+                tv.alpha        = 0f
+                tv.animate()
+                    .translationY(0f)
+                    .alpha(1f)
+                    .setDuration(200)
+                    .start()
+
+                // Schedule this line to fade after LINE_LIFE_MS
+                mainHandler.postDelayed({
+                    if (subtitleLines.contains(text)) {
+                        subtitleLines.remove(text)
+                        if (running) mainHandler.post { rebuildLines(container) }
+                    }
+                }, LINE_LIFE_MS)
+            }
+        }
+    }
+
+    private fun createRoundedBackground(): android.graphics.drawable.Drawable {
+        return android.graphics.drawable.GradientDrawable().apply {
+            shape       = android.graphics.drawable.GradientDrawable.RECTANGLE
+            cornerRadius = dp(6).toFloat()
+            setColor(Color.argb(160, 0, 0, 0))  // semi-transparent black
         }
     }
 
     private fun rescheduleSilence() {
         silenceRunnable?.let { mainHandler.removeCallbacks(it) }
         silenceRunnable = Runnable {
-            overlayView?.animate()
-                ?.alpha(0f)
-                ?.setDuration(800)
-                ?.withEndAction {
-                    srcTv?.text   = ""
-                    hindiTv?.text = ""
-                    overlayView?.alpha = 1f
-                    isVisible = false
-                }
-                ?.start()
+            // Clear all lines after silence
+            subtitleLines.clear()
+            linesContainer?.removeAllViews()
+            lastHindi = ""
         }
         mainHandler.postDelayed(silenceRunnable!!, SILENCE_MS)
     }
 
+    // ── Overlay window setup ──────────────────────────────────────────────────
+
     private fun buildOverlay() {
         try {
-            // Root container — NO background, transparent, text only
-            val container = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                // No background — pure transparent, text floats over video
-                setBackgroundColor(Color.TRANSPARENT)
-                setPadding(dp(16), dp(4), dp(16), dp(4))
-            }
-
-            // Source language text (small, light grey, strong shadow for readability)
-            srcTv = TextView(this).apply {
-                text     = ""
-                typeface = Typeface.DEFAULT
-                setTextColor(Color.parseColor("#DDDDDD"))
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-                maxLines = 2
-                // Strong multi-layer shadow so text is readable over any background
-                setShadowLayer(8f, 0f, 0f, Color.BLACK)
-                paint.isFakeBoldText = false
-            }
-
-            // Hindi translation — large, bright white, very strong shadow
-            hindiTv = TextView(this).apply {
-                text     = ""
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(Color.WHITE)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 24f)
-                setLineSpacing(dp(2).toFloat(), 1f)
-                maxLines = 3
-                // Thick black shadow gives outline effect — readable on any background
-                setShadowLayer(12f, 0f, 0f, Color.BLACK)
-            }
-
-            container.addView(srcTv,   LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT))
-            container.addView(hindiTv, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT))
-
-            overlayView = container
-
             val sw = resources.displayMetrics.widthPixels
+
+            // Outer container — full width, sits at bottom
+            val outer = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setBackgroundColor(Color.TRANSPARENT)
+                setPadding(dp(12), dp(8), dp(12), dp(8))
+            }
+
+            // Lines container — where subtitle lines are added
+            linesContainer = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setBackgroundColor(Color.TRANSPARENT)
+            }
+
+            outer.addView(linesContainer, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ))
+
+            overlayView = outer
 
             params = WindowManager.LayoutParams(
                 sw,
@@ -239,7 +273,7 @@ class OverlayService : Service() {
             // Draggable
             var startRawX = 0f; var startRawY = 0f
             var initX = 0;      var initY = 0
-            container.setOnTouchListener { _, ev ->
+            outer.setOnTouchListener { _, ev ->
                 val p = params ?: return@setOnTouchListener false
                 when (ev.action) {
                     MotionEvent.ACTION_DOWN -> {
