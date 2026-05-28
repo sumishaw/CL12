@@ -321,75 +321,81 @@ class SpeechCaptureService : Service() {
         val ageMs = System.currentTimeMillis() - stampMs
         if (ageMs > STALE_MS) { Log.d(TAG, "Pre-send stale ${ageMs}ms"); return }
 
-        var conn: HttpURLConnection? = null
-        try {
-            conn = URL(WHISPER_URL).openConnection() as HttpURLConnection
-            conn.requestMethod  = "POST"
-            conn.setRequestProperty("Content-Type",   "audio/wav")
-            conn.setRequestProperty("Content-Length", wavBytes.size.toString())
-            conn.setRequestProperty("Connection",     "keep-alive")
-            conn.doOutput       = true
-            conn.connectTimeout = CONNECT_TIMEOUT_MS
-            conn.readTimeout    = READ_TIMEOUT_MS
+        // Retry loop — retries up to 4 times on 503 (server busy)
+        // Server blocks up to 8s for queue space, so 503 is now very rare
+        // but we still retry to guarantee no drops
+        var attempts = 0
+        while (attempts < 4) {
+            attempts++
+            val ageNow = System.currentTimeMillis() - stampMs
+            if (ageNow > STALE_MS) { Log.d(TAG, "Stale after retry ${ageNow}ms"); return }
 
-            conn.outputStream.use { it.write(wavBytes) }
+            var conn: HttpURLConnection? = null
+            try {
+                conn = URL(WHISPER_URL).openConnection() as HttpURLConnection
+                conn.requestMethod  = "POST"
+                conn.setRequestProperty("Content-Type",   "audio/wav")
+                conn.setRequestProperty("Content-Length", wavBytes.size.toString())
+                conn.setRequestProperty("Connection",     "keep-alive")
+                conn.doOutput       = true
+                conn.connectTimeout = CONNECT_TIMEOUT_MS
+                conn.readTimeout    = READ_TIMEOUT_MS
 
-            val respCode = conn.responseCode
-            if (respCode == 503) {
-                // Server busy — retry this chunk once after 500ms instead of dropping it
-                Log.d(TAG, "Server busy 503 — retrying in 500ms")
-                Thread.sleep(500)
-                conn.disconnect()
-                sendToWhisper(wavBytes, stampMs)  // retry once
-                return
-            }
-            if (respCode != 200) { handleWhisperFailure("HTTP $respCode"); return }
+                conn.outputStream.use { it.write(wavBytes) }
 
-            val body       = conn.inputStream.bufferedReader(Charsets.UTF_8).readText()
-            val json       = JSONObject(body)
-            val hindiText  = json.optString("text",        "").trim()
-            val srcText    = json.optString("source_text", "").trim()
-            val lang       = json.optString("language",    "")
-            val confidence = json.optDouble("confidence",  0.0)
-
-            consecutiveErrors.set(0)
-            if (reconnecting) {
-                reconnecting = false; reconnectBackoffMs = 2_000L
-                mainHandler.post {
-                    updateNotification("Translating video audio to Hindi…")
-                    OverlayService.updateText("", "✓ Reconnected — listening…")
-                    MainActivity.instance?.notifyWhisperReconnected()
+                val respCode = conn.responseCode
+                if (respCode == 503) {
+                    Log.d(TAG, "Server busy 503 — retry $attempts/4 in 500ms")
+                    conn.disconnect()
+                    Thread.sleep(500)
+                    continue  // retry
                 }
+                if (respCode != 200) { handleWhisperFailure("HTTP $respCode"); return }
+
+                val body       = conn.inputStream.bufferedReader(Charsets.UTF_8).readText()
+                val json       = JSONObject(body)
+                val hindiText  = json.optString("text",        "").trim()
+                val srcText    = json.optString("source_text", "").trim()
+                val lang       = json.optString("language",    "")
+                val confidence = json.optDouble("confidence",  0.0)
+
+                consecutiveErrors.set(0)
+                if (reconnecting) {
+                    reconnecting = false; reconnectBackoffMs = 2_000L
+                    mainHandler.post {
+                        updateNotification("Translating video audio to Hindi…")
+                        OverlayService.updateText("", "✓ Reconnected — listening…")
+                        MainActivity.instance?.notifyWhisperReconnected()
+                    }
+                }
+                lastPushMs.set(System.currentTimeMillis())
+                scheduleWatchdog()
+
+                if (hindiText.length < 2) return
+
+                if (lastPushedHindi.isNotEmpty() && isTooSimilar(hindiText, lastPushedHindi)) {
+                    Log.d(TAG, "Dedup skip")
+                    return
+                }
+
+                Log.d(TAG, "[$lang/${(confidence*100).toInt()}%] ${srcText.take(50)} → ${hindiText.take(60)}")
+                lastPushedHindi = hindiText
+                latestOriginal  = srcText
+                latestEnglish   = srcText
+                latestHindi     = hindiText
+
+                mainHandler.post {
+                    OverlayService.updateText(srcText, hindiText)
+                    MainActivity.instance?.onTranslation(srcText, hindiText, hindiText)
+                }
+                return  // success — exit retry loop
+
+            } catch (e: Exception) {
+                Log.w(TAG, "Whisper error (attempt $attempts): ${e.javaClass.simpleName}: ${e.message}")
+                if (attempts >= 4) handleWhisperFailure(e.message ?: "unknown")
+            } finally {
+                try { conn?.disconnect() } catch (_: Exception) {}
             }
-            lastPushMs.set(System.currentTimeMillis())
-            scheduleWatchdog()
-
-            // Skip empty translations
-            if (hindiText.length < 2) return
-
-            // Client-side dedup (95%) — last line of defence against duplicates
-            if (lastPushedHindi.isNotEmpty() && isTooSimilar(hindiText, lastPushedHindi)) {
-                Log.d(TAG, "Dedup skip")
-                return
-            }
-
-            Log.d(TAG, "[$lang/${(confidence*100).toInt()}%] ${srcText.take(50)} → ${hindiText.take(60)}")
-            lastPushedHindi = hindiText
-            latestOriginal  = srcText
-            latestEnglish   = srcText
-            latestHindi     = hindiText
-
-            mainHandler.post {
-                OverlayService.updateText(srcText, hindiText)
-                MainActivity.instance?.onTranslation(srcText, hindiText, hindiText)
-            }
-
-        } catch (e: Exception) {
-            Log.w(TAG, "Whisper error: ${e.javaClass.simpleName}: ${e.message}")
-            handleWhisperFailure(e.message ?: "unknown")
-        } finally {
-            // Always disconnect — prevents connection leaks
-            try { conn?.disconnect() } catch (_: Exception) {}
         }
     }
 
