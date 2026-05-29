@@ -51,7 +51,11 @@ class LiveCaptionReader : AccessibilityService() {
     private var lastSentText   = ""
     private var lastHindiOut   = ""
     private var lastDetectedLang = ""        // track language switches
-    private val translateQueue = LinkedBlockingQueue<String>(8)
+    // Queue size 2 only — CT2 takes ~500ms-2s per translation.
+    // Deep queue means stale translations arrive long after speech moved on.
+    // We always clear and replace with newest so CT2 only ever translates
+    // the most recent content, never a backlog of outdated sentences.
+    private val translateQueue = LinkedBlockingQueue<String>(2)
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -233,10 +237,12 @@ class LiveCaptionReader : AccessibilityService() {
     private fun enqueueForTranslation(text: String) {
         forceJob?.cancel()
         forceJob = null
-        if (text.isBlank() || text == lastSentText) return
-        lastSentText = text
-        if (translateQueue.size >= 8) translateQueue.poll()
+        if (text.isBlank()) return
+        // Always clear stale items and insert the freshest text.
+        // Never translate a backlog — subtitle must match current speech.
+        translateQueue.clear()
         translateQueue.offer(text)
+        lastSentText = text
     }
 
     /** Coarse script detection for language-switch tracking only. */
