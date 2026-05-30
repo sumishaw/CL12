@@ -111,7 +111,25 @@ class LiveCaptionReader : AccessibilityService() {
         forceJob?.cancel()
         watchdogJob?.cancel()
         translateJob?.cancel()
+        translateQueue.clear()
         scope.cancel()
+        // Clear shared state so next session starts blank
+        SpeechCaptureService.latestHindi   = ""
+        SpeechCaptureService.latestEnglish = ""
+        SpeechCaptureService.latestOriginal = ""
+        OverlayService.updateText("", "")   // clears overlay display
+        // Clear server translation cache so next session gets fresh translations
+        scope.launch(Dispatchers.IO) {
+            try {
+                val conn = java.net.URL("http://127.0.0.1:8765/clear_cache")
+                    .openConnection() as java.net.HttpURLConnection
+                conn.connectTimeout = 1000
+                conn.readTimeout    = 1000
+                conn.responseCode   // trigger request
+                conn.disconnect()
+            } catch (_: Exception) {}
+        }
+        CaptionLogger.stop()
         super.onDestroy()
     }
 
