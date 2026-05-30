@@ -134,6 +134,8 @@ class LiveCaptionReader : AccessibilityService() {
                 val sendText = withContext(Dispatchers.Main) {
                     try { readFromCaptionWindow() } catch (_: Exception) { null }
                 } ?: continue
+                // Only act if this text hasn't already been enqueued by the event path
+                if (sendText == lastSentText) continue
                 Log.d(TAG, "Watchdog→ ${sendText.take(60)}")
                 scheduleTranslation(sendText)
             }
