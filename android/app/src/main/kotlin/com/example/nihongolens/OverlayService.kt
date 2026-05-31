@@ -40,11 +40,10 @@ class OverlayService : Service() {
         }
     }
 
-    // Minimum time each translation unit stays visible (ms)
-    // Enough to read 2 lines of Hindi at comfortable pace
-    private val READ_MS      = 3_000L
+    // Maximum time each translation unit stays visible before advancing to next
+    private val READ_MS      = 7_000L
     // After last speech, fade overlay after this silence
-    private val SILENCE_MS   = 8_000L
+    private val SILENCE_MS   = 10_000L
 
     // FIFO queue of translation units (each = full Hindi result, not split)
     private val displayQueue  = ArrayDeque<String>()
@@ -132,16 +131,15 @@ class OverlayService : Service() {
         showText(text, animate = true)
 
         // Schedule advancing to next item after READ_MS
+        // If queue is building up (3+ items waiting), advance after half time
+        // so we don't fall too far behind the speech
         readRunnable?.let { mainHandler.removeCallbacks(it) }
         readRunnable = Runnable {
             if (!running) return@Runnable
-            if (displayQueue.isNotEmpty()) {
-                // More items waiting — advance
-                showNext()
-            }
-            // else: keep current text on screen until silence or new text
+            if (displayQueue.isNotEmpty()) showNext()
         }
-        mainHandler.postDelayed(readRunnable!!, READ_MS)
+        val waitMs = if (displayQueue.size >= 3) READ_MS / 2 else READ_MS
+        mainHandler.postDelayed(readRunnable!!, waitMs)
     }
 
     // ── Render ────────────────────────────────────────────────────────────────
