@@ -45,7 +45,9 @@ class OverlayService : Service() {
     private val WORD_INTERVAL_MS = 0L      // instant — words pop in fast
     private val HOLD_MS          = 3_500L  // read time when 2 lines full
     private val SILENCE_MS       = 8_000L  // fade after no speech
-    private val LINE_CHARS       = 52      // ~26 chars per line × 2 lines
+    // Hindi words average 5-8 chars. At 20sp on a 12-inch tablet, ~32 chars per line.
+    // 2 lines = ~64 chars. Use 90 to be safe and truly fill both lines.
+    private val LINE_CHARS       = 90
 
     private val tokenCounter  = AtomicLong(0)
     private var expectedToken = 0L
