@@ -32,9 +32,8 @@ class OverlayService : Service() {
         const val CHANNEL_ID = "nihongo_overlay"
         const val NOTIF_ID   = 1
 
-        // holdMs lives in companion — set directly by MainActivity, read by service
-        // @Volatile ensures instant visibility across threads
-        @Volatile var holdMs: Long = 6_000L   // default: Average
+        // holdMs lives in companion — written by setHoldMs, read by service instance
+        @Volatile @JvmField var holdMs: Long = 6_000L   // default: Average
 
         @Volatile var latestOriginal = ""
         @Volatile var latestHindi    = ""
@@ -51,11 +50,9 @@ class OverlayService : Service() {
             instance?.handler?.post { instance?.onClear() }
         }
 
-        // Called directly from MainActivity — no callback needed
         fun setHoldMs(ms: Long) {
             val clamped = ms.coerceIn(0, 15_000)
             holdMs = clamped
-            // Apply immediately: if switching TO live, cancel any running animation
             if (clamped == 0L) {
                 instance?.handler?.post { instance?.switchToLive() }
             }
