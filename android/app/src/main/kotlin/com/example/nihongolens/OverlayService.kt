@@ -97,8 +97,27 @@ class OverlayService : Service() {
         pushCallback  = { _, hindi -> handler.post { onPush(hindi) } }
         clearCallback = { handler.post { onClear() } }
         holdCallback  = { ms ->
-            // Only update holdMsVar — never interrupt current display cycle
-            holdMsVar = ms.coerceIn(1_000, 15_000)
+            val newMs = ms.coerceIn(0, 15_000)   // 0 = live
+            val wasLive = holdMsVar == LIVE_MODE
+            holdMsVar = newMs
+
+            handler.post {
+                if (newMs == LIVE_MODE) {
+                    // Switching TO live — cancel any pending word/hold timers
+                    cancelAll(); isRunning_ = false; queue.clear()
+                } else if (wasLive) {
+                    // Switching FROM live — nothing pending, ready for next push
+                } else {
+                    // Speed change between non-live presets — reschedule pending hold
+                    val pending = holdRunnable
+                    if (pending != null) {
+                        handler.removeCallbacks(pending)
+                        holdRunnable = null
+                        handler.postDelayed(pending, newMs)
+                        holdRunnable = pending
+                    }
+                }
+            }
         }
     }
 
@@ -119,9 +138,22 @@ class OverlayService : Service() {
 
     // ── Queue management ──────────────────────────────────────────────────────
 
+    // holdMsVar = 0 means LIVE mode — show instantly, no word-by-word, no hold
+    private val LIVE_MODE = 0L
+
     private fun onPush(hindi: String) {
         if (hindi.isBlank()) return
         val token = tokenCounter.incrementAndGet()
+
+        // LIVE mode: skip queue entirely, show text immediately
+        if (holdMsVar == LIVE_MODE) {
+            cancelAll()
+            isRunning_ = false
+            setText(hindi.trim())
+            reschedSilence()
+            return
+        }
+
         queue.put(Item(token, hindi.trim()))
         reschedSilence()
         if (!isRunning_) showNext()
@@ -191,18 +223,18 @@ class OverlayService : Service() {
     }
 
     private fun scheduleHold(token: Long) {
+        val capturedHold = holdMsVar   // read current value
         holdRunnable = Runnable {
             holdRunnable = null
             if (!running) return@Runnable
             if (token < expectedToken) { isRunning_ = false; fadeOut(); return@Runnable }
-            // Hold complete — clear and show next
             fadeOut()
             isRunning_ = false
             if (queue.isNotEmpty()) {
-                handler.postDelayed({ showNext() }, 150) // brief gap between sentences
+                handler.postDelayed({ showNext() }, 150)
             }
         }
-        handler.postDelayed(holdRunnable!!, holdMsVar)
+        handler.postDelayed(holdRunnable!!, capturedHold)
     }
 
     private fun cancelAll() {
