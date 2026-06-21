@@ -157,6 +157,23 @@ class MainActivity : FlutterActivity() {
                     result.success(true)
                 }
 
+                "setTtsEnabled" -> {
+                    val on = call.argument<Boolean>("enabled") ?: false
+                    HindiTtsService.setEnabled(on)
+                    result.success(true)
+                }
+
+                "setTtsGender" -> {
+                    val gender = call.argument<String>("gender") ?: "auto"
+                    val g = when (gender) {
+                        "male"   -> HindiTtsService.Gender.MALE
+                        "female" -> HindiTtsService.Gender.FEMALE
+                        else     -> HindiTtsService.Gender.AUTO
+                    }
+                    HindiTtsService.setGender(g)
+                    result.success(true)
+                }
+
                 "getLatestTranslation" ->
                     result.success(mapOf(
                         "original" to SpeechCaptureService.latestOriginal,
@@ -173,6 +190,7 @@ class MainActivity : FlutterActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        HindiTtsService.init(this)
         checkAndNotifyWhisperReady()
     }
 
@@ -195,6 +213,7 @@ class MainActivity : FlutterActivity() {
         pendingProjectionResult = null
         stopIdlePoll()
         healthExecutor.shutdownNow()
+        HindiTtsService.destroy()
         instance = null
         super.onDestroy()
     }
