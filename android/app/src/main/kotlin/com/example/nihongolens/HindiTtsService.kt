@@ -42,15 +42,15 @@ object HindiTtsService {
     @Volatile var isSpeaking      = false
     @Volatile private var speakingUntilMs = 0L
 
+    // TTS dedup — don't speak same sentence twice
+    private var lastSpokenNorm = ""
+
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    // Two-stage pipeline:
-    // Stage 1: text items waiting to be fetched from TTS server
-    // Stage 2: WAV bytes ready to play
     data class TtsItem(val text: String, val speed: Float, val pitch: Float)
     data class WavItem(val wav: ByteArray, val pitch: Float)
 
-    private val fetchQueue = java.util.concurrent.LinkedBlockingQueue<TtsItem>(4)
+    private val fetchQueue = java.util.concurrent.LinkedBlockingQueue<TtsItem>(3)
     private val playQueue  = java.util.concurrent.LinkedBlockingQueue<WavItem>(2)
 
     private var fetchWorker: Job? = null
@@ -68,22 +68,26 @@ object HindiTtsService {
     fun setEnabled(on: Boolean) {
         enabled = on
         if (!on) {
-            fetchQueue.clear()
-            playQueue.clear()
+            fetchQueue.clear(); playQueue.clear()
+            lastSpokenNorm = ""
             stopMediaPlayer()
         }
     }
 
-    fun setGender(gender: Gender) {
-        selectedGender = gender
-    }
+    fun setGender(gender: Gender) { selectedGender = gender }
 
     fun speak(hindiText: String) {
         if (!enabled || hindiText.isBlank()) return
+
+        // Dedup — skip if same as last spoken
+        val n = hindiText.trim().replace(Regex("\\s+"), " ")
+        if (n == lastSpokenNorm) return
+        lastSpokenNorm = n
+
         val emotion        = detectEmotion(hindiText)
         val (speed, pitch) = emotionAndGenderParams(emotion)
-        // Drop oldest if fetch queue full — stay current with subtitle pace
-        if (fetchQueue.size >= 4) fetchQueue.poll()
+        // Drop oldest if full — stay current
+        if (fetchQueue.size >= 3) fetchQueue.poll()
         fetchQueue.offer(TtsItem(hindiText, speed, pitch))
     }
 
@@ -93,8 +97,7 @@ object HindiTtsService {
     fun destroy() {
         fetchWorker?.cancel(); playWorker?.cancel()
         fetchQueue.clear(); playQueue.clear()
-        stopMediaPlayer()
-        scope.cancel()
+        stopMediaPlayer(); scope.cancel()
     }
 
     // ── Stage 1: Fetch worker (generates WAV in background) ───────────────────
@@ -158,25 +161,26 @@ object HindiTtsService {
     }
 
     private fun emotionAndGenderParams(emotion: Emotion): Pair<Float, Float> {
-        // Determine effective gender
         val gender = if (selectedGender == Gender.AUTO) detectedGender else selectedGender
 
         // Base speed and pitch per emotion
         val (baseSpeed, basePitch) = when (emotion) {
-            Emotion.EXCITED -> Pair(1.15f, 1.10f)
+            Emotion.EXCITED -> Pair(1.10f, 1.08f)
             Emotion.HAPPY   -> Pair(1.05f, 1.05f)
             Emotion.CURIOUS -> Pair(0.95f, 1.02f)
-            Emotion.SAD     -> Pair(0.80f, 0.95f)
-            Emotion.ANGRY   -> Pair(1.10f, 1.00f)
-            Emotion.NEUTRAL -> Pair(1.00f, 1.00f)
+            Emotion.SAD     -> Pair(0.82f, 0.94f)
+            Emotion.ANGRY   -> Pair(1.08f, 1.00f)
+            Emotion.NEUTRAL -> Pair(1.05f, 1.00f)  // slightly faster base = keeps up with speech
         }
 
-        // Gender modifier on top of emotion
-        // Female: softer pitch (1.15x), slightly slower — natural Indian female
-        // Male:   unchanged
+        // Female: soft Indian women voice
+        //   pitch 1.08 = slightly higher but NOT harsh (1.3 was too harsh)
+        //   speed 0.90 = gentle, measured pace
+        //   The combination of moderate pitch + slower speed = natural Indian female
+        // Male: natural rohan voice with slight speed boost
         return when (gender) {
-            Gender.FEMALE -> Pair(baseSpeed * 0.92f, basePitch * 1.15f)
-            else          -> Pair(baseSpeed, basePitch)
+            Gender.FEMALE -> Pair(baseSpeed * 0.90f, basePitch * 1.08f)
+            else          -> Pair(baseSpeed * 1.02f, basePitch * 1.00f)
         }
     }
 
