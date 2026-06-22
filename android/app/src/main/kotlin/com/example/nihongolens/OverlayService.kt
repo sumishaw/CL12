@@ -169,29 +169,25 @@ class OverlayService : Service() {
         val totalWords = words.size.coerceAtLeast(1)
         var index      = 0
         var built      = ""
-        val snap       = holdMs   // capture speed at sentence start
-
-        // ms per word: words fill in 60% of hold time so 40% remains for reading
-        val msPerWord  = ((snap * 0.6) / totalWords).toLong().coerceIn(80, 500)
 
         fun tick() {
             wordRunnable = null
             if (!alive || item.token < expectedToken) { active = false; fadeOut(); return }
-
-            // If user switched to live mid-sentence, stop word-by-word
             if (holdMs == 0L) { active = false; return }
 
             if (index >= words.size) {
-                // All words shown — hold for remaining time then advance
-                val elapsed  = msPerWord * totalWords
-                val holdTime = (snap - elapsed).coerceAtLeast(500L)
+                // All words shown — hold for remaining read time then advance
+                // Read holdMs fresh here so speed changes take effect immediately
+                val currentHold = holdMs
+                val elapsed     = ((currentHold * 0.6) / totalWords * totalWords).toLong()
+                val holdTime    = (currentHold - elapsed).coerceIn(300L, currentHold)
                 holdRunnable = Runnable {
                     holdRunnable = null
                     if (!alive) return@Runnable
                     if (item.token < expectedToken) { active = false; fadeOut(); return@Runnable }
                     fadeOut()
                     active = false
-                    if (queue.isNotEmpty()) handler.postDelayed({ advance() }, 120)
+                    if (queue.isNotEmpty()) handler.postDelayed({ advance() }, 100)
                 }
                 handler.postDelayed(holdRunnable!!, holdTime)
                 return
@@ -201,6 +197,8 @@ class OverlayService : Service() {
             index++
             setTextDirect(built)
 
+            // msPerWord: read holdMs fresh each tick so speed changes take immediate effect
+            val msPerWord = ((holdMs * 0.6) / totalWords).toLong().coerceIn(60, 450)
             wordRunnable = Runnable { tick() }
             handler.postDelayed(wordRunnable!!, msPerWord)
         }
