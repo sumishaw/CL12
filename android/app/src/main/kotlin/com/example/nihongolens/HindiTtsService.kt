@@ -89,13 +89,13 @@ object HindiTtsService {
                         // Grace period prevents mic from picking up echo of last words
                         if (tts?.isSpeaking == false) {
                             isSpeaking = false
-                            speakingUntilMs = System.currentTimeMillis() + 2_000L
+                            speakingUntilMs = System.currentTimeMillis() + 3_000L
                         }
                         // If more queued, isSpeaking stays true until all done
                     }
                     override fun onError(id: String?)  {
                         isSpeaking = false
-                        speakingUntilMs = System.currentTimeMillis() + 1_000L
+                        speakingUntilMs = System.currentTimeMillis() + 3_000L
                     }
                 })
                 ttsReady = true
@@ -161,9 +161,9 @@ object HindiTtsService {
         val id = "utt_${uttId++}"
         val params = Bundle().apply {
             putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, id)
-            // STREAM_NOTIFICATION = 5 — excluded from Live Captions audio capture
-            // Live Captions only captures STREAM_MUSIC (3) and STREAM_GAME
-            putString(TextToSpeech.Engine.KEY_PARAM_STREAM, "5")
+            // STREAM_MUSIC — plays through speakers so mic can detect gender
+            // Loop prevention handled by Devanagari blocking + isSuppressed() grace period
+            putString(TextToSpeech.Engine.KEY_PARAM_STREAM, android.media.AudioManager.STREAM_MUSIC.toString())
         }
 
         // Mark as speaking BEFORE queuing — ensures isSuppressed() is true
