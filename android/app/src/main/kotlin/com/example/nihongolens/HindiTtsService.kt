@@ -109,13 +109,14 @@ object HindiTtsService {
     // ── Enqueue sentence ─────────────────────────────────────────────────────
 
     fun speak(hindi: String) {
-        if (!enabled || hindi.isBlank()) return
+        if (!enabled) { Log.d(TAG, "speak() skipped — TTS disabled"); return }
+        if (hindi.isBlank()) return
         val n = hindi.trim().replace(Regex("\\s+"), " ")
-        if (n == lastSpokenNorm) return
+        if (n == lastSpokenNorm) { Log.d(TAG, "speak() dedup skip"); return }
         lastSpokenNorm = n
-        // Drop oldest if queue is building up — stay near real time
         while (queue.size >= 4) queue.poll()
         queue.offer(n)
+        Log.d(TAG, "speak() queued q=${queue.size} '${n.take(30)}'")
     }
 
     // ── Single worker — fetch WAV → show subtitle → play → clear → repeat ────
@@ -203,12 +204,27 @@ object HindiTtsService {
     // ── WAV playback ─────────────────────────────────────────────────────────
 
     private suspend fun playWav(wav: ByteArray) {
-        // Parse duration from WAV header
         val sr    = readInt(wav, 24).coerceAtLeast(8_000)
         val nCh   = readShort(wav, 22).coerceAtLeast(1)
         val bits  = readShort(wav, 34).coerceAtLeast(8)
         val pcm   = (wav.size - 44).coerceAtLeast(0)
         val durMs = (pcm.toLong() * 1000) / (sr.toLong() * nCh * (bits / 8))
+
+        Log.d(TAG, "playWav dur=${durMs}ms size=${wav.size}B sr=$sr")
+
+        // Write WAV to cache dir — must happen on IO thread
+        val f = withContext(Dispatchers.IO) {
+            try {
+                val dir = cacheDir ?: run {
+                    Log.e(TAG, "cacheDir null — init() not called?"); return@withContext null
+                }
+                val file = java.io.File(dir, "tts_hindi.wav")
+                file.writeBytes(wav)
+                file
+            } catch (e: Exception) {
+                Log.e(TAG, "write WAV: ${e.message}"); null
+            }
+        } ?: return
 
         val latch = java.util.concurrent.CountDownLatch(1)
 
@@ -218,43 +234,43 @@ object HindiTtsService {
                 val mp = android.media.MediaPlayer()
                 mp.setAudioAttributes(
                     AudioAttributes.Builder()
-                        // USAGE_ASSISTANT → excluded from Live Captions capture
                         .setUsage(AudioAttributes.USAGE_ASSISTANT)
                         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                         .build()
                 )
-
-                // Write to cache file
-                val f = java.io.File(cacheDir, "tts_play.wav")
-                f.writeBytes(wav)
                 mp.setDataSource(f.absolutePath)
-
+                mp.setOnPreparedListener {
+                    Log.d(TAG, "MP prepared, starting")
+                    it.start()
+                }
                 mp.setOnCompletionListener {
+                    Log.d(TAG, "MP complete")
                     try { it.release() } catch (_: Exception) {}
                     mediaPlayer = null
                     latch.countDown()
                 }
                 mp.setOnErrorListener { it, w, x ->
-                    Log.e(TAG, "MP err w=$w x=$x")
+                    Log.e(TAG, "MP error what=$w extra=$x")
                     try { it.release() } catch (_: Exception) {}
                     mediaPlayer = null
                     latch.countDown()
                     true
                 }
-                mp.prepare()
-                mp.start()
                 mediaPlayer = mp
-                Log.d(TAG, "Playing sid=${ if(selectedGender==Gender.AUTO) detectedGender else selectedGender } dur=${durMs}ms speed=${ttsSpeedMultiplier}x")
+                mp.prepareAsync()   // non-blocking — fires onPreparedListener when ready
+                Log.d(TAG, "MP prepareAsync called")
             } catch (e: Exception) {
-                Log.e(TAG, "playWav: ${e.message}"); latch.countDown()
+                Log.e(TAG, "playWav setup: ${e.message}")
+                latch.countDown()
             }
         }
 
-        // Wait for actual playback duration + small buffer
-        val timeout = (durMs + 500L).coerceAtMost(30_000L)
-        withContext(Dispatchers.IO) {
+        // Wait for completion using actual duration as timeout
+        val timeout = (durMs + 2_000L).coerceIn(3_000L, 60_000L)
+        val done = withContext(Dispatchers.IO) {
             latch.await(timeout, java.util.concurrent.TimeUnit.MILLISECONDS)
         }
+        if (!done) Log.w(TAG, "playWav timeout after ${timeout}ms")
     }
 
     private fun stopMp() {
