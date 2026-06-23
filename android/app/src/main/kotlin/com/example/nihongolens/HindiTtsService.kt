@@ -2,9 +2,6 @@ package com.example.nihongolens
 
 import android.content.Context
 import android.media.AudioAttributes
-import android.media.AudioFormat
-import android.media.AudioRecord
-import android.media.MediaRecorder
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -12,7 +9,6 @@ import kotlinx.coroutines.*
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.LinkedBlockingQueue
-import kotlin.math.sqrt
 
 /**
  * HindiTtsService — speaks translated Hindi subtitles
@@ -70,34 +66,22 @@ object HindiTtsService {
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    // Gender fusion
-    private val textHistory  = ArrayDeque<Gender>()
-    private val pitchHistory = ArrayDeque<Gender>()
-    private val HISTORY_SIZE = 10
-    private var pitchDetector: InternalAudioPitchDetector? = null
 
     // ── Init / lifecycle ─────────────────────────────────────────────────────
 
+    private var genderPollJob: Job? = null
+    private val genderHistory  = ArrayDeque<Gender>()
+    private val GENDER_HISTORY = 6
+
     fun init(context: Context) {
-        // Use internal audio detector (captures screen audio, not mic)
-        // Falls back to mic-based ZCR if projection not available
-        pitchDetector = InternalAudioPitchDetector(context) { gender ->
-            if (!isSuppressed()) {
-                pitchHistory.addLast(gender)
-                if (pitchHistory.size > HISTORY_SIZE) pitchHistory.removeFirst()
-                updateFusedGender()
-            }
-        }
         startFetchWorker()
         startPlayWorker()
+        startGenderPoller()
     }
 
     fun setEnabled(on: Boolean) {
         enabled = on
-        if (on) {
-            if (selectedGender == Gender.AUTO) pitchDetector?.start()
-        } else {
-            pitchDetector?.stop()
+        if (!on) {
             fetchQueue.clear(); playQueue.clear()
             stopMediaPlayer(); lastSpokenNorm = ""
         }
@@ -105,7 +89,7 @@ object HindiTtsService {
 
     fun setGender(gender: Gender) {
         selectedGender = gender
-        if (gender == Gender.AUTO) pitchDetector?.start() else pitchDetector?.stop()
+        if (gender != Gender.AUTO) genderHistory.clear()
     }
 
     fun setSpeedMultiplier(mult: Float) {
@@ -116,10 +100,51 @@ object HindiTtsService {
         isSpeaking || System.currentTimeMillis() < speakingUntilMs
 
     fun destroy() {
-        pitchDetector?.stop()
+        genderPollJob?.cancel()
         fetchWorker?.cancel(); playWorker?.cancel()
         fetchQueue.clear(); playQueue.clear()
         stopMediaPlayer(); scope.cancel()
+    }
+
+    // ── Gender poller — reads FFT pitch analysis from whisper_server /gender ──
+    // whisper_server.py already does FFT on real audio (Whisper input).
+    // It detects male(85-180Hz) vs female(180-350Hz) fundamental frequency.
+    // We poll every 2s to get the current speaker's gender.
+    // isSuppressed() prevents reading during TTS playback.
+
+    private fun startGenderPoller() {
+        genderPollJob = scope.launch {
+            while (isActive) {
+                if (selectedGender == Gender.AUTO && !isSuppressed()) {
+                    try {
+                        val conn = URL("http://127.0.0.1:8765/gender")
+                            .openConnection() as java.net.HttpURLConnection
+                        conn.connectTimeout = 2_000
+                        conn.readTimeout    = 3_000
+                        if (conn.responseCode == 200) {
+                            val json = org.json.JSONObject(
+                                conn.inputStream.bufferedReader().readText())
+                            val g    = json.optString("gender", "neutral")
+                            val conf = json.optInt("confidence", 0)
+                            if (g != "neutral" && conf >= 3) {
+                                val gender = if (g == "female") Gender.FEMALE else Gender.MALE
+                                genderHistory.addLast(gender)
+                                if (genderHistory.size > GENDER_HISTORY) genderHistory.removeFirst()
+                                val fCount = genderHistory.count { it == Gender.FEMALE }
+                                val newGender = if (fCount > genderHistory.size / 2)
+                                    Gender.FEMALE else Gender.MALE
+                                if (newGender != detectedGender) {
+                                    detectedGender = newGender
+                                    Log.d(TAG, "Gender → $detectedGender (audio FFT: $g conf=$conf)")
+                                }
+                            }
+                        }
+                        conn.disconnect()
+                    } catch (_: Exception) {}
+                }
+                delay(2_000)
+            }
+        }
     }
 
     // ── Called by LiveCaptionReader after each translation ───────────────────
@@ -127,57 +152,27 @@ object HindiTtsService {
     fun speak(hindiText: String) {
         if (!enabled || hindiText.isBlank()) return
         val n = hindiText.trim().replace(Regex("\\s+"), " ")
-        if (n == lastSpokenNorm) return
+        // Only skip if EXACTLY the same text — not progressively different LC text
+        if (n == lastSpokenNorm) {
+            Log.d(TAG, "TTS skip dup: '${n.take(30)}'")
+            return
+        }
         lastSpokenNorm = n
 
-        val emotion    = detectEmotion(hindiText)
+        val emotion        = detectEmotion(hindiText)
         val (baseSpeed, _) = emotionParams(emotion)
-        // Apply user speed multiplier — 1x=normal, 2x=twice as fast etc.
-        val speed = (baseSpeed * ttsSpeedMultiplier).coerceIn(0.5f, 4.0f)
-        val sid   = effectiveSid()
+        val speed          = (baseSpeed * ttsSpeedMultiplier).coerceIn(0.5f, 4.0f)
+        val sid            = effectiveSid()
+
+        // Always enqueue — FIFO never drops
+        val dropped = fetchQueue.size > 6
+        if (dropped) {
+            // Too far behind — clear old backlog, keep only latest
+            fetchQueue.clear(); playQueue.clear()
+            Log.w(TAG, "TTS backlog cleared — too far behind")
+        }
         fetchQueue.offer(FetchItem(hindiText, sid, speed))
-    }
-
-    // Update text-signal gender from source text
-    fun updateGenderFromText(srcText: String, lang: String) {
-        if (selectedGender != Gender.AUTO) return
-        val g = GenderDetector.detect(srcText, lang) ?: return
-        textHistory.addLast(g)
-        if (textHistory.size > HISTORY_SIZE) textHistory.removeFirst()
-        updateFusedGender()
-    }
-
-    // ── Gender fusion ────────────────────────────────────────────────────────
-
-    private fun updateFusedGender() {
-        val textSignal  = majorityVote(textHistory)
-        val pitchSignal = majorityVote(pitchHistory)
-
-        detectedGender = when {
-            // Strong text signal — definite pronoun match
-            textHistory.size >= 3 && textSignal != null -> textSignal
-            // Strong pitch signal — frequency clearly male/female
-            pitchHistory.size >= 5 && pitchSignal != null -> pitchSignal
-            // Both agree
-            textSignal != null && pitchSignal != null && textSignal == pitchSignal -> textSignal
-            // Text wins over pitch on tie
-            textSignal != null -> textSignal
-            // Pitch fallback
-            pitchSignal != null -> pitchSignal
-            // Default
-            else -> detectedGender
-        }
-    }
-
-    private fun majorityVote(history: ArrayDeque<Gender>): Gender? {
-        if (history.isEmpty()) return null
-        val f = history.count { it == Gender.FEMALE }
-        val m = history.count { it == Gender.MALE }
-        return when {
-            f > m -> Gender.FEMALE
-            m > f -> Gender.MALE
-            else  -> null
-        }
+        Log.d(TAG, "TTS enq sid=$sid spd=$speed '${hindiText.take(30)}' q=${fetchQueue.size}")
     }
 
     private fun effectiveSid(): Int {
@@ -217,18 +212,20 @@ object HindiTtsService {
     private fun startFetchWorker() {
         fetchWorker = scope.launch {
             while (isActive) {
-                val item = fetchQueue.poll(2, java.util.concurrent.TimeUnit.SECONDS) ?: continue
+                val item = try { fetchQueue.take() } catch (_: InterruptedException) { continue }
                 if (!enabled) continue
                 try {
                     val wav = requestTts(item.text, item.sid, item.speed)
                     if (wav != null && wav.size > 44) {
-                        val sr   = readInt(wav, 24)
-                        val nCh  = readShort(wav, 22)
-                        val bits = readShort(wav, 34)
+                        val sr     = readInt(wav, 24)
+                        val nCh    = readShort(wav, 22)
+                        val bits   = readShort(wav, 34)
                         val pcmLen = wav.size - 44
-                        val durationMs = (pcmLen.toLong() * 1000) /
-                            (sr.toLong() * nCh * (bits / 8))
-                        playQueue.offer(PlayItem(wav, durationMs))
+                        val durMs  = (pcmLen.toLong() * 1000) / (sr.toLong() * nCh * (bits / 8))
+                        playQueue.offer(PlayItem(wav, durMs))
+                        Log.d(TAG, "Fetched ${durMs}ms WAV → playQueue size=${playQueue.size}")
+                    } else {
+                        Log.w(TAG, "Empty WAV for '${item.text.take(30)}'")
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Fetch: ${e.message}")
@@ -240,19 +237,19 @@ object HindiTtsService {
     private fun startPlayWorker() {
         playWorker = scope.launch {
             while (isActive) {
-                val item = playQueue.poll(2, java.util.concurrent.TimeUnit.SECONDS) ?: continue
+                // Use take() — blocks until item available with no timeout wait
+                val item = try { playQueue.take() } catch (_: InterruptedException) { continue }
                 if (!enabled) continue
                 try {
                     isSpeaking = true
                     playWav(item.wav)
-                    // Short grace — just enough to prevent re-capture of final syllables
-                    speakingUntilMs = System.currentTimeMillis() + 500L
                 } catch (e: Exception) {
                     Log.e(TAG, "Play: ${e.message}")
                 } finally {
                     isSpeaking = false
+                    speakingUntilMs = System.currentTimeMillis() + 400L
                 }
-                // No delay between sentences — play queue drains continuously
+                // No delay — immediately poll next sentence
             }
         }
     }
@@ -286,42 +283,56 @@ object HindiTtsService {
 
     private suspend fun playWav(wavBytes: ByteArray) {
         val latch = java.util.concurrent.CountDownLatch(1)
+
+        // Parse duration from WAV header for accurate wait
+        val sr     = readInt(wavBytes, 24).coerceAtLeast(8000)
+        val nCh    = readShort(wavBytes, 22).coerceAtLeast(1)
+        val bits   = readShort(wavBytes, 34).coerceAtLeast(8)
+        val pcmLen = (wavBytes.size - 44).coerceAtLeast(0)
+        val wavDurMs = (pcmLen.toLong() * 1000) / (sr.toLong() * nCh * (bits / 8))
+
         withContext(Dispatchers.Main) {
             try {
-                mediaPlayer?.let { try { it.release() } catch (_: Exception) {} }
+                mediaPlayer?.let { try { it.stop(); it.release() } catch (_: Exception) {} }
                 mediaPlayer = null
+
                 val mp = android.media.MediaPlayer()
                 mp.setAudioAttributes(AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_ASSISTANT)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build())
                 mp.setVolume(1.0f, 1.0f)
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
-                    mp.setDataSource(ByteArrayMediaDataSource(wavBytes))
-                } else {
-                    val f = java.io.File("/data/local/tmp/tts_kokoro.wav")
-                    f.parentFile?.mkdirs(); f.writeBytes(wavBytes)
-                    mp.setDataSource(f.absolutePath)
-                }
+
+                // Write WAV to temp file — reliable on all Android versions
+                val f = java.io.File("/data/local/tmp/tts_${System.currentTimeMillis()}.wav")
+                f.parentFile?.mkdirs()
+                f.writeBytes(wavBytes)
+                mp.setDataSource(f.absolutePath)
+
                 mp.setOnCompletionListener {
                     try { it.release() } catch (_: Exception) {}
-                    mediaPlayer = null; latch.countDown()
+                    mediaPlayer = null
+                    try { f.delete() } catch (_: Exception) {}
+                    latch.countDown()
                 }
                 mp.setOnErrorListener { it, w, x ->
                     Log.e(TAG, "MP err w=$w x=$x")
                     try { it.release() } catch (_: Exception) {}
-                    mediaPlayer = null; latch.countDown(); true
+                    mediaPlayer = null
+                    try { f.delete() } catch (_: Exception) {}
+                    latch.countDown(); true
                 }
-                mp.prepare()
-                mp.start()
-                mediaPlayer = mp
-                Log.d(TAG, "TTS playing sid=${effectiveSid()} ${mp.duration}ms")
+                mp.prepareAsync()
+                mp.setOnPreparedListener { it.start(); mediaPlayer = it }
             } catch (e: Exception) {
-                Log.e(TAG, "playWav: ${e.message}"); latch.countDown()
+                Log.e(TAG, "playWav setup: ${e.message}"); latch.countDown()
             }
         }
+
+        // Wait for completion — use wav duration + 20% buffer as safety timeout
+        val timeoutMs = (wavDurMs * 1.2).toLong().coerceAtLeast(2000).coerceAtMost(30_000)
         withContext(Dispatchers.IO) {
-            latch.await(35, java.util.concurrent.TimeUnit.SECONDS)
+            latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
         }
     }
 
@@ -420,139 +431,4 @@ object GenderDetector {
             else            -> null   // ambiguous — don't override history
         }
     }
-}
-
-// ── InternalAudioPitchDetector — frequency-based gender from video audio ──────
-// Uses AudioRecord with UNPROCESSED source which captures internal screen audio
-// on many Android devices, unlike VOICE_RECOGNITION which only captures mic.
-// Skips analysis during TTS playback (isSuppressed) to avoid self-detection.
-
-class InternalAudioPitchDetector(
-    private val context: Context,
-    private val onGender: (HindiTtsService.Gender) -> Unit
-) {
-    private val scope  = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var job:   Job? = null
-
-    private val SR        = 16_000
-    private val FRAMES    = 1_600    // 100ms
-    // ZCR thresholds empirically tuned for 16kHz
-    private val ZCR_F_HI  = 0.060f  // definitely female
-    private val ZCR_F_LO  = 0.038f  // probably female (combined with history)
-    private val HISTORY   = 15
-    private val history   = ArrayDeque<HindiTtsService.Gender>()
-
-    // Try sources in order: UNPROCESSED captures internal audio on many devices
-    private val AUDIO_SOURCES = listOf(
-        MediaRecorder.AudioSource.UNPROCESSED,   // internal audio on many devices
-        MediaRecorder.AudioSource.VOICE_RECOGNITION,
-        MediaRecorder.AudioSource.DEFAULT,
-    )
-
-    fun start() {
-        if (job?.isActive == true) return
-        job = scope.launch {
-            val minBuf = AudioRecord.getMinBufferSize(SR,
-                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-            val bufSize = maxOf(minBuf, FRAMES * 2)
-
-            // Try each audio source until one works
-            var rec: AudioRecord? = null
-            for (src in AUDIO_SOURCES) {
-                try {
-                    val r = AudioRecord(src, SR, AudioFormat.CHANNEL_IN_MONO,
-                        AudioFormat.ENCODING_PCM_16BIT, bufSize)
-                    if (r.state == AudioRecord.STATE_INITIALIZED) {
-                        rec = r
-                        Log.d("PitchDetector", "Using audio source: $src")
-                        break
-                    } else r.release()
-                } catch (_: Exception) {}
-            }
-
-            if (rec == null) {
-                Log.e("PitchDetector", "No audio source available")
-                return@launch
-            }
-
-            try {
-                rec.startRecording()
-                val buf = ShortArray(FRAMES)
-                while (isActive) {
-                    val read = rec.read(buf, 0, FRAMES)
-                    if (read <= 0) { delay(50); continue }
-
-                    // Skip during TTS playback
-                    if (HindiTtsService.isSuppressed()) { delay(100); continue }
-
-                    // RMS energy check — skip silence and very quiet audio
-                    val rms = sqrt(buf.take(read).sumOf { it.toLong() * it }.toDouble() / read)
-                    if (rms < 120) { delay(30); continue }
-
-                    // Zero-crossing rate — primary pitch estimator
-                    var zc = 0
-                    for (i in 1 until read) if ((buf[i] >= 0) != (buf[i-1] >= 0)) zc++
-                    val zcr = zc.toFloat() / read
-
-                    // Spectral centroid — secondary check (higher = female)
-                    val centroid = spectralCentroid(buf, read, SR)
-
-                    val g = when {
-                        zcr > ZCR_F_HI -> HindiTtsService.Gender.FEMALE
-                        zcr > ZCR_F_LO && centroid > 2200f -> HindiTtsService.Gender.FEMALE
-                        zcr < ZCR_F_LO -> HindiTtsService.Gender.MALE
-                        centroid < 1800f -> HindiTtsService.Gender.MALE
-                        else -> null
-                    } ?: continue
-
-                    history.addLast(g)
-                    if (history.size > HISTORY) history.removeFirst()
-
-                    // Report only when 65%+ consistent
-                    val fCount = history.count { it == HindiTtsService.Gender.FEMALE }
-                    val thresh = (HISTORY * 0.65).toInt()
-                    val confident = when {
-                        fCount >= thresh                    -> HindiTtsService.Gender.FEMALE
-                        (history.size - fCount) >= thresh   -> HindiTtsService.Gender.MALE
-                        else                               -> null
-                    }
-                    if (confident != null) withContext(Dispatchers.Main) { onGender(confident) }
-                    delay(100)
-                }
-            } finally {
-                try { rec.stop(); rec.release() } catch (_: Exception) {}
-            }
-        }
-    }
-
-    private fun spectralCentroid(buf: ShortArray, size: Int, sr: Int): Float {
-        // Simple spectral centroid: weighted average of frequency bins
-        var weightedSum = 0.0; var totalEnergy = 0.0
-        val n = size.coerceAtMost(512)
-        for (i in 0 until n) {
-            val freq = i.toDouble() * sr / n
-            val amp  = buf[i].toDouble().let { it * it }
-            weightedSum += freq * amp
-            totalEnergy += amp
-        }
-        return if (totalEnergy < 1) 0f else (weightedSum / totalEnergy).toFloat()
-    }
-
-    fun stop() { job?.cancel(); job = null; history.clear() }
-}
-
-// ── ByteArrayMediaDataSource ──────────────────────────────────────────────────
-
-@androidx.annotation.RequiresApi(android.os.Build.VERSION_CODES.M)
-class ByteArrayMediaDataSource(private val data: ByteArray) :
-    android.media.MediaDataSource() {
-    override fun readAt(pos: Long, buf: ByteArray, off: Int, size: Int): Int {
-        if (pos >= data.size) return -1
-        val end  = minOf(pos + size, data.size.toLong()).toInt()
-        val read = end - pos.toInt()
-        data.copyInto(buf, off, pos.toInt(), end)
-        return read
-    }
-    override fun getSize() = data.size.toLong()
-    override fun close() {}
 }
