@@ -341,7 +341,13 @@ class LiveCaptionReader : AccessibilityService() {
             return
         }
 
-        // LOOP PREVENTION 1b: Block romanized Hindi — TTS audio transcribed as Latin by LC
+        // Skip very short texts — single words like "Time.", "Like," are not worth translating
+        // They are usually mid-sentence LC accumulation artifacts
+        val wordCount = text.trim().split(Regex("\\s+")).size
+        if (wordCount < 4) {
+            CaptionLogger.log(TAG, "SKIP: too short ($wordCount words)")
+            return
+        }
         // These words appear in LC when TTS Hindi speech is re-captured
         val lower = text.lowercase()
         val romanizedHindi = listOf(
