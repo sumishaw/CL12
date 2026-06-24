@@ -33,7 +33,7 @@ object GenderAnalyzer {
     private const val TAU_MAX = (SR / 60.0).toInt()    // 60 Hz  lower limit  = 266 samples
     private const val YIN_THRESHOLD = 0.15f             // lower = stricter pitch confidence
     private const val HIST = 5           // vote history — switch on 3/5 majority
-    private const val RMS_FLOOR = 200.0  // skip very quiet frames (silence / noise)
+    private const val RMS_FLOOR = 200f   // skip very quiet frames (silence / noise)
 
     @Volatile var enabled = false
 
@@ -90,7 +90,7 @@ object GenderAnalyzer {
         // RMS check — skip silence and near-silence
         var energy = 0.0
         for (s in accum) energy += s.toLong() * s
-        val rms = sqrt(energy / WIN)
+        val rms = sqrt(energy / WIN).toFloat()
         if (rms < RMS_FLOOR) return
 
         // Normalize to float [-1, 1]
