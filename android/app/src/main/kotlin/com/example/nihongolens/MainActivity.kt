@@ -427,7 +427,7 @@ class MainActivity : FlutterActivity() {
                 CaptionLogger.log("MainActivity", "Gender projection granted")
                 // If LiveCaptionReader is already connected, restart with projection
                 if (LiveCaptionReader.isRunning) {
-                    lcProjection?.let { GenderAnalyzer.startMic(it) }
+                    lcProjection?.let { GenderAnalyzer.start(it) }
                 }
             } else {
                 Log.w(TAG, "Gender projection denied — mic fallback will be used")
