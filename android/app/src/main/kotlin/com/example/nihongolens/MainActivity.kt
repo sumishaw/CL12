@@ -1,561 +1,455 @@
 package com.example.nihongolens
 
-import android.accessibilityservice.AccessibilityService
-import android.accessibilityservice.AccessibilityServiceInfo
-import android.view.accessibility.AccessibilityEvent
-import android.view.accessibility.AccessibilityNodeInfo
-import kotlinx.coroutines.*
-import org.json.JSONObject
+import android.Manifest
+import android.app.Activity
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionManager
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.provider.Settings
+import android.util.Log
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodChannel
 import java.net.HttpURLConnection
 import java.net.URL
-import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.Executors
 
 /**
- * LiveCaptionReader — Live Captions → Hindi translation → Overlay
+ * MainActivity
  *
- * Key design decisions:
- * - readWindow() extracts the LAST COMPLETE SENTENCE from LC accumulated text
- *   (sentence ending with 。？！\n or punctuation) — not raw accumulated text
- * - Simple dedup: only skip if exact same text was last enqueued
- * - No grow-gate: every meaningful new sentence is enqueued
- * - FIFO queue (unbounded) with sequence tokens — nothing dropped by dedup logic
- * - Queue cap=5 only drops oldest when severely backlogged (CT2 slow)
+ * Manages the Flutter MethodChannel bridge and whisper server health monitoring.
+ *
+ * Reconnect additions:
+ *   • notifyWhisperDisconnected() — tells Flutter UI to show "Whisper Unreachable" card
+ *   • notifyWhisperReconnected()  — tells Flutter UI to show "Speech Model Ready" card
+ *   • Periodic background health check every 30 s while capture is NOT running,
+ *     so the status card stays accurate when the user is on the home screen.
  */
-class LiveCaptionReader : AccessibilityService() {
+class MainActivity : FlutterActivity() {
 
     companion object {
-        private const val TAG              = "LCReader"
-        private const val TRANSLATE_URL    = "http://127.0.0.1:8765/translate_text"
-        private const val CONNECT_TIMEOUT  = 3_000
-        private const val READ_TIMEOUT     = 35_000
-        private const val DEBOUNCE_MS      = 400L
-        private const val WATCHDOG_MS      = 2_000L
-        private const val STARTUP_GRACE_MS = 1_000L
-        private const val LANG_CONFIRM     = 3
-        private const val QUEUE_CAP        = 5
+        @Volatile var instance: MainActivity? = null
 
-        private val LC_PACKAGES = setOf(
-            "com.google.android.as",
-            "com.google.android.as.oss",
-            "com.google.android.tts",
-        )
+        private const val REQ_MEDIA_PROJECTION = 200
+        private const val REQ_AUDIO_PERMISSION  = 100
+        private const val TAG                   = "MainActivity"
 
-        @Volatile var isRunning = false
-        @Volatile var instance: LiveCaptionReader? = null
+        private const val WHISPER_HEALTH_URL = "http://127.0.0.1:8765/ready"
+
+        /** Interval for background health polling when capture is idle (ms). */
+        private const val IDLE_HEALTH_POLL_MS = 30_000L
     }
 
-    private val scope       = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var pendingJob:   Job? = null
-    private var translateJob: Job? = null
-    private var watchdogJob:  Job? = null
+    private val CHANNEL = "overlay_channel"
+    private var methodChannel: MethodChannel? = null
 
-    // FIFO + tokens
-    private val queue      = LinkedBlockingQueue<Pair<Long, String>>()
-    private val seqCounter = AtomicLong(0)
-    @Volatile private var expectedSeq = 0L
+    @Volatile private var pendingProjectionResult: MethodChannel.Result? = null
 
-    // Simple dedup — only exact match
-    private var lastEnqueued  = ""
-    private var lastHindiOut  = ""
-    private var lastHindiTime = 0L
-    private val HINDI_DEDUP_MS = 4_000L
+    private val healthExecutor = Executors.newSingleThreadExecutor()
+    private val mainHandler    = Handler(Looper.getMainLooper())
 
-    // Language tracking
-    private var confirmedLang = ""
-    private var pendingLang   = ""
-    private var pendingCount  = 0
+    /** Background idle-poll runnable — runs only while capture is stopped. */
+    private var idlePollRunnable: Runnable? = null
 
-    // Window state
-    private var lastRawFull           = ""
-    private var lastSentText          = ""
-    private var lastEnqueuedSents     = mutableSetOf<String>()
-    private var lcVisible             = false
-    private var startupTime           = 0L
+    // ── Flutter method channel ─────────────────────────────────────────────────
 
-    // Stats
-    private val evtCount = AtomicLong(0)
-    private val enqCount = AtomicLong(0)
-    private val okCount  = AtomicLong(0)
-    private val errCount = AtomicLong(0)
+    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+        super.configureFlutterEngine(flutterEngine)
+        instance = this
+
+        methodChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+        methodChannel?.setMethodCallHandler { call, result ->
+            when (call.method) {
+
+                "openAccessibilitySettings" -> {
+                    startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                    result.success(true)
+                }
+
+                "hasOverlayPermission" ->
+                    result.success(Settings.canDrawOverlays(this))
+
+                "requestOverlayPermission" -> {
+                    if (!Settings.canDrawOverlays(this)) {
+                        startActivity(Intent(
+                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            Uri.parse("package:$packageName")
+                        ))
+                        result.success(false)
+                    } else {
+                        result.success(true)
+                    }
+                }
+
+                "hasAudioPermission" ->
+                    result.success(
+                        ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                            == PackageManager.PERMISSION_GRANTED
+                    )
+
+                "requestAudioPermission" ->
+                    requestAudioThenProjection(result)
+
+                "checkAccessibilityEnabled" -> result.success(true)
+                "openAccessibilitySettings" -> result.success(true)
+
+                // ── Whisper server readiness checks ──────────────────────────
+
+                "isModelReady" -> checkWhisperReady { ready ->
+                    runOnUiThread { result.success(ready) }
+                }
+
+                "getModelStatus" -> checkWhisperReady { ready ->
+                    runOnUiThread {
+                        result.success(if (ready) "ready" else "not_downloaded")
+                    }
+                }
+
+                "startModelDownload" -> {
+                    result.success(true)
+                    checkAndNotifyWhisperReady()
+                }
+
+                // ── Overlay ──────────────────────────────────────────────────
+
+                "startOverlay" -> {
+                    val i = Intent(this, OverlayService::class.java)
+                    startForegroundServiceCompat(i)
+                    // Mute mic — prevents TTS audio from reaching Live Captions via mic
+                    val am = getSystemService(AUDIO_SERVICE) as android.media.AudioManager
+                    am.isMicrophoneMute = true
+                    result.success(true)
+                }
+
+                "stopOverlay" -> {
+                    stopService(Intent(this, OverlayService::class.java))
+                    val am = getSystemService(AUDIO_SERVICE) as android.media.AudioManager
+                    am.isMicrophoneMute = false
+                    GenderAnalyzer.stop()
+                    result.success(true)
+                }
+
+                // ── Speech capture ────────────────────────────────────────────
+
+                "startSpeechCapture" -> {
+                    stopIdlePoll()   // SpeechCaptureService manages its own reconnect now
+                    requestAudioThenProjection(result)
+                }
+
+                "stopSpeechCapture" -> {
+                    stopService(Intent(this, SpeechCaptureService::class.java))
+                    result.success(true)
+                    startIdlePoll()  // resume idle polling while capture is stopped
+                }
+
+                "isSpeechCaptureRunning" ->
+                    result.success(SpeechCaptureService.isRunning)
+
+                "setTargetLanguage" -> {
+                    SpeechCaptureService.targetLanguage = "hindi"
+                    result.success(true)
+                }
+
+                "setSubtitleSpeed" -> {
+                    val seconds = (call.argument<Double>("seconds") ?: 6.0)
+                    OverlayService.setHoldMs((seconds * 1000).toLong())
+                    result.success(true)
+                }
+
+                "setTtsEnabled" -> {
+                    val on = call.argument<Boolean>("enabled") ?: false
+                    HindiTtsService.setEnabled(on)
+                    result.success(true)
+                }
+
+                "setTtsGender" -> {
+                    val gender = call.argument<String>("gender") ?: "auto"
+                    val g = when (gender) {
+                        "male"   -> HindiTtsService.Gender.MALE
+                        "female" -> HindiTtsService.Gender.FEMALE
+                        else     -> HindiTtsService.Gender.AUTO
+                    }
+                    HindiTtsService.setGender(g)
+                    result.success(true)
+                }
+
+                "setTtsSpeed" -> {
+                    val speed = (call.argument<Double>("speed") ?: 1.5).toFloat()
+                    HindiTtsService.setSpeedMultiplier(speed)
+                    result.success(true)
+                }
+
+                "getLatestTranslation" ->
+                    result.success(mapOf(
+                        "original" to SpeechCaptureService.latestOriginal,
+                        "english"  to SpeechCaptureService.latestEnglish,
+                        "hindi"    to SpeechCaptureService.latestHindi
+                    ))
+
+                else -> result.notImplemented()
+            }
+        }
+    }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
-    override fun onServiceConnected() {
-        super.onServiceConnected()
-        instance    = this
-        isRunning   = true
-        startupTime = System.currentTimeMillis()
-
-        serviceInfo = serviceInfo?.also {
-            it.eventTypes = (AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
-                AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED or
-                AccessibilityEvent.TYPE_WINDOWS_CHANGED)
-            it.feedbackType        = AccessibilityServiceInfo.FEEDBACK_GENERIC
-            it.notificationTimeout = 100
-            it.flags = (AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
-                AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS)
-            it.packageNames = null
-        }
-
-        resetAll()
-        startWorker()
-        startWatchdog()
-        startStats()
-        CaptionLogger.log(TAG, "=== Connected ===")
-        scope.launch(Dispatchers.Main) { MainActivity.instance?.onLiveCaptionReaderConnected() }
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        HindiTtsService.init(this)
+        checkAndNotifyWhisperReady()
     }
 
-    override fun onInterrupt() { CaptionLogger.log(TAG, "Interrupted") }
+    override fun onResume() {
+        super.onResume()
+        instance = this
+        // Re-check whisper status every time the user comes back to the app
+        if (!SpeechCaptureService.isRunning) {
+            checkAndNotifyWhisperReady()
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        // Keep idle polling running in background so status card is fresh on resume
+    }
 
     override fun onDestroy() {
-        isRunning = false; instance = null
-        pendingJob?.cancel()
-        watchdogJob?.cancel(); translateJob?.cancel()
-        queue.clear(); scope.cancel()
-        SpeechCaptureService.latestHindi    = ""
-        SpeechCaptureService.latestEnglish  = ""
-        SpeechCaptureService.latestOriginal = ""
-        OverlayService.updateText("", "")
-        CaptionLogger.stop()
+        pendingProjectionResult?.success(false)
+        pendingProjectionResult = null
+        stopIdlePoll()
+        healthExecutor.shutdownNow()
+        HindiTtsService.destroy()
+        instance = null
         super.onDestroy()
     }
 
-    // ── Events ────────────────────────────────────────────────────────────────
+    // ── Idle health polling (when capture is not running) ──────────────────────
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (!isRunning || event == null) return
-        if (System.currentTimeMillis() - startupTime < STARTUP_GRACE_MS) return
-        evtCount.incrementAndGet()
-        val text = readWindow() ?: return
-        schedule(text)
-    }
-
-    // ── Watchdog ──────────────────────────────────────────────────────────────
-
-    private fun startWatchdog() {
-        watchdogJob = scope.launch {
-            var tick = 0L
-            while (isActive && isRunning) {
-                delay(WATCHDOG_MS)
-                if (System.currentTimeMillis() - startupTime < STARTUP_GRACE_MS) continue
-                tick++
-                val text = withContext(Dispatchers.Main) {
-                    try { readWindow() } catch (_: Exception) { null }
-                } ?: run {
-                    if (tick % 20L == 0L)
-                        CaptionLogger.log(TAG, "WD null tick=$tick vis=$lcVisible")
-                    return@run null
-                } ?: continue
-                schedule(text)
-            }
-        }
-    }
-
-    // ── Stats ─────────────────────────────────────────────────────────────────
-
-    private fun startStats() {
-        scope.launch {
-            while (isActive && isRunning) {
-                delay(30_000L)
-                CaptionLogger.log(TAG, "STATS evt=${evtCount.get()} enq=${enqCount.get()} " +
-                    "ok=${okCount.get()} err=${errCount.get()} q=${queue.size} " +
-                    "vis=$lcVisible lang=$confirmedLang seq=$expectedSeq")
-            }
-        }
-    }
-
-    // ── Window reader ─────────────────────────────────────────────────────────
-
-    private fun readWindow(): String? {
-        val wins = try { windows } catch (_: Exception) { return null }
-
-        var root: AccessibilityNodeInfo? = null
-        wins?.forEach { w ->
-            if (root != null) return@forEach
-            val r = try { w.root } catch (_: Exception) { null } ?: return@forEach
-            if (r.packageName?.toString() in LC_PACKAGES) root = r else r.recycle()
-        }
-
-        if (root == null) {
-            if (lcVisible) {
-                lcVisible             = false
-                lastRawFull           = ""
-                lastEnqueued          = ""
-                lastSentText          = ""
-                lastEnqueuedSents.clear()
-                val dropped = queue.size
-                queue.clear()
-                expectedSeq = seqCounter.get() + 1
-                pendingJob?.cancel(); pendingJob = null
-                if (dropped > 0) CaptionLogger.log(TAG, "LC gone dropped=$dropped")
-                else              CaptionLogger.log(TAG, "LC gone")
-                OverlayService.clearQueue()
-                // Stop TTS immediately — video is silent/paused
-                HindiTtsService.stopAndClear()
-                sentenceTimerJob?.cancel(); sentenceTimerJob = null
-                sentenceBuffer = ""; lastBufferEnqueued = ""; lastEnqueuedWordCount = 0
-                lastEnqueuedText = ""
-            }
-            return null
-        }
-
-        val nodes = mutableListOf<String>()
-        collectText(root, nodes)
-        root.recycle()
-
-        val full = nodes.filter { validCaption(it) && !uiLabel(it) }
-            .maxByOrNull { it.length }?.trim() ?: return null
-
-        if (!lcVisible) {
-            lcVisible   = true
-            lastRawFull = ""
-            lastEnqueuedSents.clear()
-            CaptionLogger.log(TAG, "LC appeared '${full.take(60)}'")
-        }
-
-        if (full == lastRawFull) return null
-
-        val prev    = lastRawFull
-        lastRawFull = full
-
-        // Get only the NEW text added since last read
-        val newText = if (prev.isNotEmpty() && full.startsWith(prev))
-            full.substring(prev.length).trim()
-        else {
-            // LC window scrolled or reset — use only the last sentence of full text
-            // Split by sentence boundary and take the last complete-looking sentence
-            val sentences = full.split(Regex("""(?<=[.!?。！？])\s+"""))
-            sentences.lastOrNull { it.trim().length >= 4 }?.trim() ?: return null
-        }
-
-        if (newText.length >= 4) return newText
-        return null
-    }
-
-    private fun splitSentences(text: String): List<String> {
-        val result = mutableListOf<String>()
-        val parts  = text.split(Regex("""(?<=[。！？
-.!?])\s*"""))
-        for (part in parts) {
-            val t = part.trim()
-            if (t.length >= 4) result.add(t)
-        }
-        if (result.isEmpty() && text.trim().length >= 4) result.add(text.trim())
-        return result
-    }
-
-    private fun directEnqueue(text: String) {
-        if (text.isBlank() || text.length < 4) return
-        val n = norm(text)
-        if (n == lastEnqueued) return
-        lastEnqueued = n
-        val seq = seqCounter.incrementAndGet()
-        if (queue.size >= QUEUE_CAP) queue.poll()
-        queue.offer(Pair(seq, text))
-        enqCount.incrementAndGet()
-        CaptionLogger.log(TAG, "ENQ-S seq=$seq q=${queue.size} '${text.take(60)}'")
-    }
-
-    // ── Scheduling ────────────────────────────────────────────────────────────
-
-    private fun norm(t: String) = t.trim().replace(Regex("\\s+"), " ")
-
-    private var sentenceBuffer      = ""
-    private var lastBufferEnqueued  = ""   // tracks last text actually sent to worker
-    private var lastLCChangeMs      = 0L
-    private val SENTENCE_SILENCE_MS = 600L
-    private var sentenceTimerJob: Job? = null
-    private var lastEnqueuedWordCount = 0
-    private var lastEnqueuedText      = ""
-
-    private fun schedule(text: String) {
-        // Language detection
-        val script = detectScript(text)
-        if (script != confirmedLang) {
-            if (script == pendingLang) {
-                if (++pendingCount >= LANG_CONFIRM) {
-                    CaptionLogger.log(TAG, "LANG $confirmedLang→$script")
-                    confirmedLang = script; pendingLang = ""; pendingCount = 0
-                    lastEnqueued = ""; lastRawFull = ""; lastEnqueuedSents.clear()
-                    sentenceBuffer = ""; lastBufferEnqueued = ""
-                    lastEnqueuedWordCount = 0; lastEnqueuedText = ""
-                    queue.clear(); expectedSeq = seqCounter.get() + 1
-                }
-            } else { pendingLang = script; pendingCount = 1 }
-        } else { pendingLang = ""; pendingCount = 0 }
-
-        sentenceBuffer = text
-        lastLCChangeMs = System.currentTimeMillis()
-
-        val trimmed   = text.trim()
-        val words     = trimmed.split(Regex("\\s+")).filter { it.isNotBlank() }
-        val wordCount = words.size
-
-        // Always cap at 12 words for translation — keeps TTS under 3s per chunk
-        val toTranslate = if (wordCount > 12) words.take(12).joinToString(" ") else trimmed
-
-        // TRIGGER 1a: strong punctuation → translate immediately (100ms settle)
-        val endsWithHardPunct = trimmed.endsWith(".") || trimmed.endsWith("?") ||
-                                trimmed.endsWith("!") || trimmed.endsWith("。") ||
-                                trimmed.endsWith("？") || trimmed.endsWith("！") ||
-                                trimmed.endsWith("…")
-        if (endsWithHardPunct && wordCount >= 3) {
-            sentenceTimerJob?.cancel(); pendingJob?.cancel()
-            pendingJob = scope.launch {
-                delay(100)
-                val t = capWords(sentenceBuffer.trim(), 12)
-                if (t.isNotBlank() && t != lastEnqueuedText) {
-                    lastEnqueuedText = t; lastEnqueuedWordCount = wordCount
-                    enqueue(t); sentenceBuffer = ""
+    private fun startIdlePoll() {
+        stopIdlePoll()
+        val runnable = object : Runnable {
+            override fun run() {
+                if (!SpeechCaptureService.isRunning) {
+                    checkAndNotifyWhisperReady()
+                    mainHandler.postDelayed(this, IDLE_HEALTH_POLL_MS)
                 }
             }
-            return
         }
-
-        // TRIGGER 1b: soft punctuation (,;:-) → translate after 350ms if 5+ words
-        val endsWithSoftPunct = trimmed.endsWith(",") || trimmed.endsWith(";") ||
-                                trimmed.endsWith(":") || trimmed.endsWith(" -") ||
-                                trimmed.endsWith("—")
-        if (endsWithSoftPunct && wordCount >= 5) {
-            sentenceTimerJob?.cancel(); pendingJob?.cancel()
-            pendingJob = scope.launch {
-                delay(350)
-                val t = capWords(sentenceBuffer.trim(), 12)
-                if (t.isNotBlank() && t != lastEnqueuedText) {
-                    lastEnqueuedText = t; lastEnqueuedWordCount = wordCount
-                    enqueue(t); sentenceBuffer = ""
-                }
-            }
-            return
-        }
-
-        // TRIGGER 2: natural phrase boundary — 5+ word growth OR 8+ words total
-        // Lower threshold catches spoken phrases faster without waiting for silence
-        val grown = wordCount - lastEnqueuedWordCount
-        if ((grown >= 5 && wordCount >= 5) || (wordCount >= 8 && grown >= 3)) {
-            sentenceTimerJob?.cancel(); pendingJob?.cancel()
-            pendingJob = scope.launch {
-                delay(150)  // brief settle for word correction
-                val t = capWords(sentenceBuffer.trim(), 12)
-                if (t.isNotBlank() && t != lastEnqueuedText) {
-                    lastEnqueuedText = t; lastEnqueuedWordCount = wordCount
-                    enqueue(t); sentenceBuffer = ""
-                }
-            }
-            return
-        }
-
-        // TRIGGER 3: silence — 1.2s no change
-        sentenceTimerJob?.cancel()
-        sentenceTimerJob = scope.launch {
-            delay(SENTENCE_SILENCE_MS)
-            val t = capWords(sentenceBuffer.trim(), 12)
-            if (t.isNotBlank() && t != lastEnqueuedText && wordCount >= 3) {
-                CaptionLogger.log(TAG, "SILENCE translate")
-                lastEnqueuedText = t; lastEnqueuedWordCount = wordCount
-                enqueue(t); sentenceBuffer = ""
-            }
-        }
-        pendingJob?.cancel()
+        idlePollRunnable = runnable
+        mainHandler.postDelayed(runnable, IDLE_HEALTH_POLL_MS)
     }
 
-        private fun capWords(text: String, maxWords: Int): String {
-        val words = text.trim().split(Regex("\\s+"))
-        return if (words.size <= maxWords) text.trim()
-               else words.take(maxWords).joinToString(" ")
+    private fun stopIdlePoll() {
+        idlePollRunnable?.let { mainHandler.removeCallbacks(it) }
+        idlePollRunnable = null
     }
 
-    private fun enqueue(text: String) {
-        if (text.isBlank() || text.length < 4) return
+    // ── Whisper server health checks ──────────────────────────────────────────
 
-        // LOOP PREVENTION 1: Block ANY Devanagari — TTS output re-captured by Live Captions
-        val devanagariCount = text.count { it.code in 0x0900..0x097F }
-        if (devanagariCount > 0) {
-            CaptionLogger.log(TAG, "SKIP: Devanagari detected (TTS loop guard)")
-            return
+    private fun checkWhisperReady(onResult: (Boolean) -> Unit) {
+        healthExecutor.submit {
+            val ready = try {
+                val conn = URL(WHISPER_HEALTH_URL).openConnection() as HttpURLConnection
+                conn.requestMethod  = "GET"
+                conn.connectTimeout = 3_000
+                conn.readTimeout    = 3_000
+                conn.connect()
+                val code = conn.responseCode
+                conn.disconnect()
+                code == 200
+            } catch (_: Exception) {
+                false
+            }
+            onResult(ready)
         }
-
-        // Skip very short texts — single words like "Time.", "Like," are not worth translating
-        // They are usually mid-sentence LC accumulation artifacts
-        val wordCount = text.trim().split(Regex("\\s+")).size
-        if (wordCount < 4) {
-            CaptionLogger.log(TAG, "SKIP: too short ($wordCount words)")
-            return
-        }
-        // These words appear in LC when TTS Hindi speech is re-captured
-        val lower = text.lowercase()
-        val romanizedHindi = listOf(
-            "sunkar","muskura","heto","hain","nahin","theek","aapko",
-            "tumhe","kijiye","karein","chahiye","matlab","lekin",
-            "parantu","isliye","kyunki","waise","raha","rahi","rahe",
-            "bolta","bolti","kehta","kehti","sunta","sunti"
-        )
-        if (romanizedHindi.any { lower.contains(it) } && text.split(" ").size < 10) {
-            CaptionLogger.log(TAG, "SKIP: romanized Hindi detected '${text.take(30)}'")
-            return
-        }
-
-        // NOTE: isSuppressed() check removed — subtitle display is independent of TTS.
-        // TTS loop is prevented by: (1) Devanagari guard above, (2) romanized Hindi guard,
-        // (3) USAGE_ASSISTANT audio attribute (excluded from Live Captions capture).
-        // Blocking subtitle on isSuppressed caused 4-6s display delay per sentence.
-
-        val n = norm(text)
-        if (n == lastEnqueued || n == norm(lastSentText)) {
-            CaptionLogger.log(TAG, "SKIP dup")
-            return
-        }
-
-        lastEnqueued = n
-        val seq = seqCounter.incrementAndGet()
-
-        if (queue.size >= QUEUE_CAP) {
-            queue.poll()
-            CaptionLogger.log(TAG, "CAP: dropped oldest")
-        }
-
-        queue.offer(Pair(seq, text))
-        enqCount.incrementAndGet()
-        CaptionLogger.log(TAG, "ENQ seq=$seq q=${queue.size} '${text.take(60)}'")
     }
 
-    // ── Translation worker ────────────────────────────────────────────────────
-
-    private fun startWorker() {
-        translateJob = scope.launch {
-            while (isActive) {
-                val item = withContext(Dispatchers.IO) {
-                    try { queue.poll(2, TimeUnit.SECONDS) }
-                    catch (_: InterruptedException) { null }
-                } ?: continue
-
-                val (seq, text) = item
-                if (seq < expectedSeq) { CaptionLogger.log(TAG, "STALE $seq"); continue }
-
-                val t0     = System.currentTimeMillis()
-                lastSentText = text
-                val result = callServer(text)
-                val ms     = System.currentTimeMillis() - t0
-
-                if (seq < expectedSeq) { CaptionLogger.log(TAG, "DISCARD $seq ${ms}ms"); continue }
-
-                if (result == null) {
-                    errCount.incrementAndGet()
-                    CaptionLogger.log(TAG, "ERR ${ms}ms '${text.take(40)}'")
-                    continue
+    private fun checkAndNotifyWhisperReady() {
+        checkWhisperReady { ready ->
+            runOnUiThread {
+                if (ready) {
+                    Log.d(TAG, "whisper_server.py is ready")
+                    methodChannel?.invokeMethod("onModelReady", null)
+                } else {
+                    Log.w(TAG, "whisper_server.py not reachable on port 8765")
+                    methodChannel?.invokeMethod(
+                        "onModelError",
+                        mapOf("message" to
+                            "Whisper server not running.\n" +
+                            "Start it with:\n  python3 whisper_server.py\n" +
+                            "Then tap RETRY.")
+                    )
                 }
-
-                val (hindi, serverLang) = result
-
-                // Skip if same Hindi shown very recently
-                val now   = System.currentTimeMillis()
-                val hNorm = norm(hindi)
-                if (hNorm == norm(lastHindiOut) && (now - lastHindiTime) < HINDI_DEDUP_MS) {
-                    CaptionLogger.log(TAG, "SKIP dup Hindi")
-                    lastEnqueued = ""; lastRawFull = ""
-                    continue
-                }
-                lastHindiOut  = hindi
-                lastHindiTime = now
-
-                okCount.incrementAndGet()
-                CaptionLogger.log(TAG, "OK $seq ${ms}ms lang=$serverLang '${hindi.take(50)}'")
-                SpeechCaptureService.latestHindi   = hindi
-                SpeechCaptureService.latestEnglish = text
-
-                withContext(Dispatchers.Main) {
-                    OverlayService.updateText(text, hindi)
-                    MainActivity.instance?.onTranslation(text, hindi, hindi)
-                }
-                // Update gender from source text pronouns (works for all languages)
-                HindiTtsService.updateGenderFromSource(text, serverLang.ifBlank { confirmedLang })
-                HindiTtsService.speak(hindi)
             }
         }
     }
 
-    private fun callServer(text: String): Pair<String, String>? {
-        if (text.trim().length < 4) return null
-        var conn: HttpURLConnection? = null
-        return try {
-            conn = URL(TRANSLATE_URL).openConnection() as HttpURLConnection
-            conn.requestMethod = "POST"
-            conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            conn.doOutput       = true
-            conn.connectTimeout = CONNECT_TIMEOUT
-            conn.readTimeout    = READ_TIMEOUT
-            val body = """{"text":${JSONObject.quote(text)},"src":"auto","tgt":"hi"}"""
-            conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-            if (conn.responseCode != 200) {
-                CaptionLogger.log(TAG, "HTTP ${conn.responseCode}"); return null
-            }
-            val json = JSONObject(conn.inputStream.bufferedReader().readText())
-            val hindi = json.optString("text", "").trim()
-            val lang  = json.optString("detected_lang", confirmedLang)
-            if (hindi.isBlank()) null else Pair(hindi, lang)
+    // ── Called by SpeechCaptureService to update Flutter UI on reconnect ───────
+
+    /**
+     * Called by SpeechCaptureService when whisper becomes unreachable.
+     * Updates the Flutter model-status card to show the error state.
+     */
+    fun onLiveCaptionReaderConnected() {
+        Log.i(TAG, "LiveCaptionReader connected")
+        mainHandler.post {
+            methodChannel?.invokeMethod("onLiveCaptionReaderConnected", null)
+        }
+    }
+
+    fun notifyWhisperDisconnected() {
+        runOnUiThread {
+            Log.w(TAG, "Notifying Flutter: whisper disconnected")
+            methodChannel?.invokeMethod(
+                "onModelError",
+                mapOf("message" to
+                    "Whisper server disconnected.\n" +
+                    "Reconnecting automatically…\n" +
+                    "Tap RETRY if this persists.")
+            )
+        }
+    }
+
+    /**
+     * Called by SpeechCaptureService when whisper comes back online.
+     * Updates the Flutter model-status card to show ready state.
+     */
+    fun notifyWhisperReconnected() {
+        runOnUiThread {
+            Log.d(TAG, "Notifying Flutter: whisper reconnected")
+            methodChannel?.invokeMethod("onModelReady", null)
+        }
+    }
+
+    /** Called from SpeechCaptureService to push a translation to the Flutter UI. */
+    fun onTranslation(original: String, english: String, hindi: String) {
+        runOnUiThread {
+            methodChannel?.invokeMethod("onTranslation", mapOf(
+                "original" to original,
+                "english"  to english,
+                "hindi"    to hindi
+            ))
+        }
+    }
+
+    // ── Permission + projection flow ──────────────────────────────────────────
+
+    private fun requestAudioThenProjection(result: MethodChannel.Result) {
+        if (!Settings.canDrawOverlays(this)) {
+            result.success(false); return
+        }
+
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            == PackageManager.PERMISSION_GRANTED
+        ) {
+            requestMediaProjection(result)
+        } else {
+            deliverPendingFailure()
+            pendingProjectionResult = result
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.RECORD_AUDIO),
+                REQ_AUDIO_PERMISSION
+            )
+        }
+    }
+
+    private fun requestMediaProjection(result: MethodChannel.Result) {
+        deliverPendingFailure()
+        pendingProjectionResult = result
+        val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        try {
+            @Suppress("DEPRECATION")
+            startActivityForResult(mgr.createScreenCaptureIntent(), REQ_MEDIA_PROJECTION)
         } catch (e: Exception) {
-            CaptionLogger.log(TAG, "server ex: ${e.javaClass.simpleName}: ${e.message}"); null
-        } finally {
-            try { conn?.disconnect() } catch (_: Exception) {}
+            Log.e(TAG, "createScreenCaptureIntent failed: ${e.message}")
+            pendingProjectionResult = null
+            result.success(false)
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQ_AUDIO_PERMISSION) {
+            val pending = pendingProjectionResult
+            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                if (pending != null) {
+                    pendingProjectionResult = null
+                    requestMediaProjection(pending)
+                }
+            } else {
+                pendingProjectionResult = null
+                pending?.success(false)
+            }
+        }
+    }
+
+    @Deprecated("Required for API compatibility below 33")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+
+        if (requestCode == REQ_MEDIA_PROJECTION) {
+            val pending = pendingProjectionResult
+            pendingProjectionResult = null
+
+            if (resultCode == Activity.RESULT_OK && data != null) {
+                Log.d(TAG, "MediaProjection granted — starting SpeechCaptureService + GenderAnalyzer")
+                val i = Intent(this, SpeechCaptureService::class.java).apply {
+                    putExtra(SpeechCaptureService.EXTRA_RESULT_CODE, resultCode)
+                    putExtra(SpeechCaptureService.EXTRA_RESULT_DATA, data)
+                }
+                startForegroundServiceCompat(i)
+
+                // Start GenderAnalyzer using the MediaProjection shared by SpeechCaptureService.
+                // We must NOT call getMediaProjection() again — the token is one-time use.
+                // SpeechCaptureService.onStartCommand() sets sharedProjection synchronously,
+                // but the service starts async via startForegroundService. We poll briefly.
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                        val proj = SpeechCaptureService.sharedProjection
+                        if (proj != null) {
+                            GenderAnalyzer.start(proj)
+                            android.util.Log.d("MainActivity", "GenderAnalyzer started via sharedProjection")
+                        } else {
+                            android.util.Log.w("MainActivity", "sharedProjection null — GenderAnalyzer not started")
+                        }
+                    }, 1_500)  // 1.5s wait for SpeechCaptureService to initialise
+                }
+
+                pending?.success(true)
+            } else {
+                Log.w(TAG, "MediaProjection denied (resultCode=$resultCode)")
+                pending?.success(false)
+            }
         }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private fun resetAll() {
-        lastEnqueued = ""; lastRawFull = ""; lastSentText = ""
-        lastEnqueuedSents.clear()
-        confirmedLang = ""; pendingLang = ""; pendingCount = 0
-        lcVisible = false; expectedSeq = 0L
-        lastHindiOut = ""; lastHindiTime = 0L
-        SpeechCaptureService.latestHindi    = ""
-        SpeechCaptureService.latestEnglish  = ""
-        SpeechCaptureService.latestOriginal = ""
-    }
-
-    private fun collectText(node: AccessibilityNodeInfo?, out: MutableList<String>) {
-        node ?: return
-        node.text?.toString()?.trim()?.takeIf { it.isNotBlank() }?.let { out.add(it) }
-        node.contentDescription?.toString()?.trim()
-            ?.takeIf { it.isNotBlank() && it != out.lastOrNull() }?.let { out.add(it) }
-        for (i in 0 until node.childCount) collectText(node.getChild(i), out)
-    }
-
-    private fun uiLabel(t: String): Boolean {
-        val l = t.lowercase()
-        if (l == "live caption" || l == "live captions") return true
-        if (l.startsWith("live caption") && t.length < 30) return true
-        if (l.contains("united states") || l.contains("united kingdom")) return true
-        if (l.contains("simplified") || l.contains("traditional")) return true
-        if (t == "Hide" || t == "Settings" || t == "Feedback") return true
-        return false
-    }
-
-    private fun validCaption(t: String): Boolean {
-        if (t.length < 2 || t.length > 500) return false
-        if (t.count { it.isLetter() } < 2) return false
-        if (t.contains("com.android") || t.contains("com.google")) return false
-        if (t.contains("http") || t.contains("www.")) return false
-        return true
-    }
-
-    private fun detectScript(text: String): String {
-        var ja = 0; var zh = 0; var ko = 0; var ar = 0; var ru = 0; var hi = 0
-        for (c in text) when (c.code) {
-            in 0x3040..0x30FF -> ja++
-            in 0x4E00..0x9FFF -> zh++
-            in 0xAC00..0xD7AF -> ko++
-            in 0x0600..0x06FF -> ar++
-            in 0x0400..0x04FF -> ru++
-            in 0x0900..0x097F -> hi++
+    private fun startForegroundServiceCompat(intent: Intent) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
         }
-        val nonLatin = maxOf(ja, zh, ko, ar, ru, hi)
-        if (nonLatin > 0) return when (nonLatin) {
-            ja -> "ja"; ko -> "ko"; hi -> "hi"; ar -> "ar"; ru -> "ru"; else -> "zh"
+    }
+
+    private fun deliverPendingFailure() {
+        val stale = pendingProjectionResult
+        if (stale != null) {
+            pendingProjectionResult = null
+            try { stale.success(false) } catch (_: Exception) {}
         }
-        return if (text.any { it.isLetter() && it.code in 0x00C0..0x024F })
-            "latin_foreign" else "latin_en"
     }
 }
