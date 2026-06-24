@@ -411,21 +411,8 @@ class MainActivity : FlutterActivity() {
                 }
                 startForegroundServiceCompat(i)
 
-                // Start GenderAnalyzer using the MediaProjection shared by SpeechCaptureService.
-                // We must NOT call getMediaProjection() again — the token is one-time use.
-                // SpeechCaptureService.onStartCommand() sets sharedProjection synchronously,
-                // but the service starts async via startForegroundService. We poll briefly.
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                        val proj = SpeechCaptureService.sharedProjection
-                        if (proj != null) {
-                            GenderAnalyzer.start(proj)
-                            android.util.Log.d("MainActivity", "GenderAnalyzer started via sharedProjection")
-                        } else {
-                            android.util.Log.w("MainActivity", "sharedProjection null — GenderAnalyzer not started")
-                        }
-                    }, 1_500)  // 1.5s wait for SpeechCaptureService to initialise
-                }
+                // GenderAnalyzer is started by SpeechCaptureService.startCapture()
+                // and fed PCM directly from the shared AudioRecord — no MediaProjection needed here.
 
                 pending?.success(true)
             } else {
