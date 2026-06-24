@@ -189,7 +189,6 @@ class OverlayService : Service() {
         }
         handler.postDelayed(holdRunnable!!, hold)
     }
-    }
 
     // ── View helpers ──────────────────────────────────────────────────────────
 
@@ -284,4 +283,4 @@ class OverlayService : Service() {
             .setContentText("Hindi subtitle overlay running")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setOngoing(true).setSilent(true).build()
-}
+}  // end OverlayService
