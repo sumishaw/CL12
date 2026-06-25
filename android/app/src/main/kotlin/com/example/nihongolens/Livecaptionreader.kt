@@ -106,7 +106,7 @@ class LiveCaptionReader : AccessibilityService() {
         CaptionLogger.log(TAG, "=== Connected ===")
         // Start gender detection — pass lcProjection for headphone-safe internal audio capture
         // Falls back to mic if projection not yet granted
-        GenderAnalyzer.start(MainActivity.lcProjection)
+        GenderAnalyzer.startMic(MainActivity.lcProjection)
         scope.launch(Dispatchers.Main) { MainActivity.instance?.onLiveCaptionReaderConnected() }
     }
 
@@ -480,7 +480,9 @@ class LiveCaptionReader : AccessibilityService() {
                     MainActivity.instance?.onTranslation(text, hindi, hindi)
                 }
                 // Gender detection is audio-only (GenderAnalyzer.kt) — no pronoun detection
-                HindiTtsService.speak(hindi)
+                // Pass English source text for feminine verb form hints (she/her → ती/ी)
+                // This ONLY affects verb conjugation, NOT voice switching
+                HindiTtsService.speak(hindi, text)
             }
         }
     }
