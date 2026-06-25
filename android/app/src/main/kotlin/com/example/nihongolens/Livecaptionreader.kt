@@ -106,7 +106,7 @@ class LiveCaptionReader : AccessibilityService() {
         CaptionLogger.log(TAG, "=== Connected ===")
         // Start gender detection — pass lcProjection for headphone-safe internal audio capture
         // Falls back to mic if projection not yet granted
-        GenderAnalyzer.startMic(MainActivity.lcProjection)
+        GenderAnalyzer.start(MainActivity.lcProjection)
         scope.launch(Dispatchers.Main) { MainActivity.instance?.onLiveCaptionReaderConnected() }
     }
 
