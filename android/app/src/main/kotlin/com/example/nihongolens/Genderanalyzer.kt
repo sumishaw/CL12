@@ -66,18 +66,23 @@ object GenderAnalyzer {
      */
     fun start(projection: MediaProjection? = null) {
         stop()
+        CaptionLogger.log(TAG, "start() called — attempting Visualizer(0) global audio mix")
         try {
             // Session 0 = global audio output mix
+            // Requires RECORD_AUDIO + MODIFY_AUDIO_SETTINGS permissions
             val v = Visualizer(0)
             val capSize = Visualizer.getCaptureSizeRange()[1].coerceAtMost(1024)
             v.captureSize   = capSize
-            sampleRate      = v.samplingRate / 1000   // returns mHz → divide by 1000 for Hz
+            val rawSR = v.samplingRate
+            sampleRate = rawSR / 1000   // Visualizer returns mHz → divide by 1000 for Hz
+            CaptionLogger.log(TAG, "Visualizer init OK: rawSamplingRate=$rawSR sampleRate=${sampleRate}Hz capSize=$capSize")
             if (sampleRate < 8000) sampleRate = 44100 // fallback
 
             v.setDataCaptureListener(object : Visualizer.OnDataCaptureListener {
                 override fun onWaveFormDataCapture(viz: Visualizer, waveform: ByteArray, samplingRate: Int) {
                     if (!enabled) return
                     captureCount++
+                    if (captureCount == 1) CaptionLogger.log(TAG, "FIRST waveform! size=${waveform.size} sr=${samplingRate/1000}Hz")
                     feedWaveform(waveform)
                 }
                 override fun onFftDataCapture(viz: Visualizer, fft: ByteArray, samplingRate: Int) {}
@@ -90,7 +95,7 @@ object GenderAnalyzer {
             frameCount = 0; analyzeCount = 0; captureCount = 0
             history.clear()
 
-            CaptionLogger.log(TAG, ">>> STARTED Visualizer SR=${sampleRate}Hz capSize=$capSize <<<")
+            CaptionLogger.log(TAG, ">>> STARTED Visualizer SR=${sampleRate}Hz enabled=$enabled <<<")
         } catch (e: Exception) {
             enabled = false
             CaptionLogger.log(TAG, "Visualizer start FAILED: ${e.message}")
@@ -112,7 +117,10 @@ object GenderAnalyzer {
 
     private fun feedWaveform(waveform: ByteArray) {
         // Skip while TTS is playing — avoid detecting our own Hindi voice
-        if (HindiTtsService.isSuppressed()) { accumFill = 0; return }
+        if (HindiTtsService.isSuppressed()) {
+            accumFill = 0   // reset so we start fresh after TTS ends
+            return
+        }
 
         for (b in waveform) {
             if (accumFill < WIN) accum[accumFill++] = b
