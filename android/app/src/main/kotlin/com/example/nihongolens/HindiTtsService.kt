@@ -94,9 +94,7 @@ object HindiTtsService {
     // ── FIFO queues (unbounded — never drop sentences) ────────────────────────
     data class FetchItem(
         val text: String, val gender: String, val speed: Float,
-        val pitch: Float = 1.0f, val volume: Float = 1.0f,
-        val breathiness: Float = 0.0f, val roughness: Float = 0.0f,
-        val pitchSlope: String = "flat",
+        val volume: Float = 1.0f, val pitchSlope: String = "flat",
         val srcText: String = "", val emotion: Emotion = Emotion.NEUTRAL
     )
     data class PlayItem (val text: String, val wav: ByteArray, val durMs: Long)
@@ -178,13 +176,11 @@ object HindiTtsService {
         val emotionSpeedMult = emotion.speedMult.coerceIn(0.75f, 1.15f)
         val speed = (emotionSpeedMult * ttsSpeedMultiplier).coerceIn(0.5f, 3.0f)
 
-        // Pitch, volume, breathiness, roughness, slope from live voice profile
-        val profile     = GenderAnalyzer.currentProfile
-        val pitch       = profile.pitch.coerceIn(0.85f, 1.18f)
-        val volume      = profile.volume.coerceIn(0.5f, 2.0f)
-        val breathiness = profile.breathiness.coerceIn(0f, 0.8f)
-        val roughness   = profile.roughness.coerceIn(0f, 0.5f)
-        val pitchSlope  = profile.pitchSlope
+        // Read volume and pitch_slope from live voice profile
+        // Emotion character is conveyed via Piper native params on the server
+        val profile    = GenderAnalyzer.currentProfile
+        val volume     = profile.volume.coerceIn(0.5f, 1.8f)
+        val pitchSlope = profile.pitchSlope
         // Always store "auto" — gender resolved at fetch time so switches apply immediately
         // even for sentences already in queue
         val genderTag = when (selectedGender) {
@@ -197,8 +193,7 @@ object HindiTtsService {
         // fetchQueue is unbounded LinkedBlockingQueue so memory is safe
         fetchQueue.offer(FetchItem(
             text=n, gender=genderTag, speed=speed,
-            pitch=pitch, volume=volume, breathiness=breathiness,
-            roughness=roughness, pitchSlope=pitchSlope,
+            volume=volume, pitchSlope=pitchSlope,
             srcText=srcText, emotion=emotion
         ))
     }
@@ -288,17 +283,16 @@ object HindiTtsService {
             var conn: HttpURLConnection? = null
             try {
                 val enc = java.net.URLEncoder.encode(item.text, "UTF-8")
+                // Send emotion NAME — server maps to Piper native params (noise_scale, noise_w)
+                // No pitch shift, no noise injection — all artifact-free
                 val url = "$TTS_URL?text=$enc&gender=$resolvedGender" +
                     "&speed=${String.format("%.3f", item.speed)}" +
-                    "&pitch=${String.format("%.3f", item.pitch)}" +
+                    "&emotion=${item.emotion.name}" +
                     "&volume=${String.format("%.3f", item.volume)}" +
-                    "&breathiness=${String.format("%.3f", item.breathiness)}" +
-                    "&roughness=${String.format("%.3f", item.roughness)}" +
                     "&pitch_slope=${item.pitchSlope}"
-                CaptionLogger.log("HindiTTS", "[${item.emotion.name}] " +
-                    "spd=${String.format("%.2f",item.speed)} pch=${String.format("%.2f",item.pitch)} " +
-                    "vol=${String.format("%.2f",item.volume)} breath=${String.format("%.2f",item.breathiness)} " +
-                    "rough=${String.format("%.3f",item.roughness)} slope=${item.pitchSlope}")
+                CaptionLogger.log("HindiTTS", "[${item.emotion.name}/${item.emotion.category}] " +
+                    "spd=${String.format("%.2f",item.speed)} " +
+                    "vol=${String.format("%.2f",item.volume)} slope=${item.pitchSlope}")
                 conn = URL(url).openConnection() as HttpURLConnection
                 conn.connectTimeout = 5_000
                 conn.readTimeout    = 20_000
