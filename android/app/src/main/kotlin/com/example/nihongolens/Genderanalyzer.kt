@@ -76,8 +76,8 @@ object GenderAnalyzer {
     private var prevF0         = 0f
     private val f0Ring         = FloatArray(8)   // recent F0 values for jitter
     private var f0RingIdx      = 0
-    private var speakerF0Base  = 0f              // running F0 mean for pitch ratio
-    private var speakerF0Count = 0
+    private var maleF0Base   = 0f    // male F0 baseline (85–164Hz range)
+    private var femaleF0Base = 0f    // female F0 baseline (165–400Hz range)
     private var frameCount     = 0
     private var analyzeCount   = 0
 
@@ -111,7 +111,7 @@ object GenderAnalyzer {
         try { captureRec?.release() } catch (_: Exception) {}
         captureRec = null
         genderHistory.clear(); emotionHistory.clear()
-        accumFill = 0; speakerF0Base = 0f; speakerF0Count = 0
+        accumFill = 0; maleF0Base = 0f; femaleF0Base = 0f
         if (lastStatus != "waiting for screen capture permission")
             CaptionLogger.log(TAG, "stopped")
     }
@@ -266,11 +266,11 @@ object GenderAnalyzer {
 
         // ── PITCH RATIO vs speaker baseline ───────────────────────────────────
         // Track per-gender F0 baseline via exponential moving average
-        speakerF0Base = if (speakerF0Base == 0f) f0
-                        else speakerF0Base * 0.97f + f0 * 0.03f
-        speakerF0Count++
-        val pitchRatio = if (speakerF0Base > 0f)
-            (f0 / speakerF0Base).coerceIn(0.75f, 1.35f) else 1.0f
+        val isFemale = f0 >= F0_FEMALE_MIN
+        if (isFemale) femaleF0Base = if (femaleF0Base == 0f) f0 else femaleF0Base * 0.97f + f0 * 0.03f
+        else          maleF0Base   = if (maleF0Base   == 0f) f0 else maleF0Base   * 0.97f + f0 * 0.03f
+        val base       = if (isFemale) femaleF0Base else maleF0Base
+        val pitchRatio = if (base > 0f) (f0 / base).coerceIn(0.85f, 1.18f) else 1.0f
 
         // ── F0 SLOPE (intonation) ─────────────────────────────────────────────
         val f0Slope = if (prevF0 > 0f) (f0 - prevF0) / prevF0 else 0f
@@ -295,7 +295,7 @@ object GenderAnalyzer {
         // ── SPEAKING PACE ─────────────────────────────────────────────────────
         // Pace = inverse of silence ratio + F0 slope activity
         // High silence ratio = slower speaker; low = faster
-        val pace = (1.0f - silenceRatio * 0.4f).coerceIn(0.6f, 1.8f)
+        val pace = (1.0f - silenceRatio * 0.15f).coerceIn(0.90f, 1.10f)
 
         // ── UPDATE SMOOTHING BUFFERS ──────────────────────────────────────────
         updateSmoothing(pitchRatio, rmsNorm, breathiness, roughness)
