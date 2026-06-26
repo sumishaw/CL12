@@ -84,6 +84,7 @@ object HindiTtsService {
     @JvmField @Volatile var selectedGender    = Gender.AUTO
     @Volatile var ttsSpeedMultiplier          = 1.5f
     @Volatile var detectedGender              = Gender.MALE
+    @Volatile var sessionToken              = 0   // incremented on LC gone — stale translations discarded
     @Volatile var isSpeaking                  = false
     @Volatile private var speakingUntilMs     = 0L
 
