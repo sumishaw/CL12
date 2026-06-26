@@ -43,8 +43,10 @@ object HindiTtsService {
     private const val GENDER_URL = "http://127.0.0.1:8765/gender"
 
     enum class Gender  { AUTO, MALE, FEMALE }
+    // 23 emotion/voice types detected acoustically from media player audio
+    // Set exclusively by GenderAnalyzer — never by text analysis alone
     enum class Emotion {
-        // Basic
+        // Basic emotional states
         NEUTRAL, HAPPY, SAD, ANGRY, FEARFUL, SURPRISED, DISGUST,
         // Breathive & Low-Intensity
         BREATHY, WHISPERY, HUSHED, MURMURED,
@@ -55,6 +57,7 @@ object HindiTtsService {
         // Rhythmic & Expressive
         SIGHING, PANTING, MOANING, GASPING;
 
+        /** TTS speed multiplier — combined with user ttsSpeedMultiplier */
         val speedMult: Float get() = when (this) {
             HAPPY     -> 1.12f;  SAD      -> 0.85f;  ANGRY    -> 1.05f
             FEARFUL   -> 0.95f;  SURPRISED-> 1.08f;  DISGUST  -> 0.90f
@@ -65,6 +68,7 @@ object HindiTtsService {
             else      -> 1.00f
         }
 
+        /** Pitch multiplier sent to hindi_tts_server.py as &pitch=X */
         val pitchMult: Float get() = when (this) {
             HAPPY     -> 1.10f;  SAD      -> 0.92f;  ANGRY    -> 1.02f
             FEARFUL   -> 1.08f;  SURPRISED-> 1.12f;  DISGUST  -> 0.90f
@@ -74,12 +78,22 @@ object HindiTtsService {
             SIGHING   -> 0.90f;  PANTING  -> 1.05f;  MOANING  -> 0.87f;  GASPING  -> 1.12f
             else      -> 1.00f
         }
+
+        val category: String get() = when (this) {
+            NEUTRAL, HAPPY, SAD, ANGRY, FEARFUL, SURPRISED, DISGUST -> "basic"
+            BREATHY, WHISPERY, HUSHED, MURMURED -> "breathive"
+            VELVETY, SULTRY, WARM, TENDER -> "warm"
+            HUSKY, RASPY, GRAVELLY, STRAINED -> "intense"
+            SIGHING, PANTING, MOANING, GASPING -> "rhythmic"
+        }
     }
+
+    // Set by GenderAnalyzer from acoustic analysis of USAGE_MEDIA audio
+    // Read by speak() at enqueue time to set TTS speed+pitch
+    @Volatile var currentEmotion: Emotion = Emotion.NEUTRAL
 
     @JvmField @Volatile var enabled           = false
     @JvmField @Volatile var selectedGender    = Gender.AUTO
-    // Set by GenderAnalyzer from acoustic analysis — NOT from text
-    @Volatile var currentEmotion: Emotion = Emotion.NEUTRAL
     @Volatile var ttsSpeedMultiplier          = 1.5f
     @Volatile var detectedGender              = Gender.MALE
     @Volatile var isSpeaking                  = false
@@ -162,8 +176,7 @@ object HindiTtsService {
         if (spokenTokens.putIfAbsent(token, true) != null) return
         if (spokenTokens.size > 300) spokenTokens.clear()
 
-        // Emotion: acoustic analysis (from GenderAnalyzer) takes priority.
-        // Text-based detection fills in when audio emotion is NEUTRAL.
+        // Audio emotion (GenderAnalyzer) takes priority over text hints
         val audioEmotion = currentEmotion
         val textEmotion  = detectTextEmotion(n)
         val emotion      = if (audioEmotion != Emotion.NEUTRAL) audioEmotion else textEmotion
@@ -213,8 +226,8 @@ object HindiTtsService {
                         toFeminineHindi(item.text) else item.text
 
                     val wav = fetchWav(textToSpeak, resolvedGender, item.speed, item.pitch)
-                    if (wav != null)
-                        CaptionLogger.log("HindiTTS", "speak ${item.emotion} spd=${String.format("%.2f",item.speed)} pch=${String.format("%.2f",item.pitch)}")
+                    if (wav != null) CaptionLogger.log("HindiTTS",
+                        "[${item.emotion.name}/${item.emotion.category}] spd=${String.format("%.2f",item.speed)} pch=${String.format("%.2f",item.pitch)}")
                     if (wav != null && wav.size > 44) {
                         val sr  = readInt(wav, 24).coerceAtLeast(8_000)
                         val nch = readShort(wav, 22).coerceAtLeast(1)
@@ -265,7 +278,7 @@ object HindiTtsService {
         withContext(Dispatchers.IO) {
             var conn: HttpURLConnection? = null
             try {
-                val enc = java.net.URLEncoder.encode(text, "UTF-8")
+                val enc      = java.net.URLEncoder.encode(text, "UTF-8")
                 val pitchStr = String.format("%.3f", pitch)
                 conn = URL("$TTS_URL?text=$enc&gender=$gender&speed=$speed&pitch=$pitchStr")
                     .openConnection() as HttpURLConnection
@@ -466,24 +479,17 @@ object HindiTtsService {
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     // Text-based emotion — FALLBACK only when audio emotion is NEUTRAL
-    // Text-based emotion — FALLBACK only when audio emotion is NEUTRAL
-    // Audio emotion from GenderAnalyzer always takes priority
     private fun detectTextEmotion(t: String): Emotion {
         val l = t.lowercase()
-        // Rhythmic & Expressive — strongest textual signals
-        if (listOf("gasp","हांफ","sigh","आह","moan","कराह").any { l.contains(it) })     return Emotion.SIGHING
-        if (t.contains("...") && t.length < 20)                                          return Emotion.MURMURED
-        // Intense signals
-        if (t.contains("!!"))                                                             return Emotion.ANGRY
-        if (listOf("whisper","धीरे","hushed","murmur","शांत").any { l.contains(it) })   return Emotion.HUSHED
-        if (listOf("warm","tender","gentle","प्यार","soft").any   { l.contains(it) })   return Emotion.TENDER
-        // Basic emotions
-        if (t.endsWith("!") || t.endsWith("！"))                                         return Emotion.SURPRISED
-        if (listOf("उदास","दुखी","sad","sorry","cry","रोना").any { l.contains(it) })   return Emotion.SAD
-        if (listOf("गुस्सा","angry","hate","damn","क्रोध").any    { l.contains(it) })   return Emotion.ANGRY
-        if (listOf("डर","afraid","scared","fearful","घबरा").any   { l.contains(it) })   return Emotion.FEARFUL
-        if (listOf("वाह","wow","खुश","happy","great","love").any  { l.contains(it) })   return Emotion.HAPPY
-        if (listOf("अरे","oops","really","seriously","अचानक").any { l.contains(it) })   return Emotion.SURPRISED
+        if (t.contains("!!"))                                                              return Emotion.ANGRY
+        if (listOf("sigh","gasp","moan","whisper","murmur").any { l.contains(it) })       return Emotion.SIGHING
+        if (t.endsWith("!") || t.endsWith("！"))                                          return Emotion.SURPRISED
+        if (listOf("उदास","दुखी","sad","sorry","cry").any    { l.contains(it) })         return Emotion.SAD
+        if (listOf("गुस्सा","angry","hate","damn").any        { l.contains(it) })         return Emotion.ANGRY
+        if (listOf("डर","afraid","scared","fearful").any      { l.contains(it) })         return Emotion.FEARFUL
+        if (listOf("वाह","wow","खुश","happy","love","great").any { l.contains(it) })      return Emotion.HAPPY
+        if (listOf("warm","tender","gentle","soft","प्यार").any  { l.contains(it) })      return Emotion.TENDER
+        if (listOf("whisper","hushed","धीरे","शांत").any        { l.contains(it) })       return Emotion.HUSHED
         return Emotion.NEUTRAL
     }
 
