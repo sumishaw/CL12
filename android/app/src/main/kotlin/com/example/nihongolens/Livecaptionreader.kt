@@ -418,6 +418,17 @@ class LiveCaptionReader : AccessibilityService() {
             return
         }
 
+        // Skip music/sound annotations — they have no translatable speech content
+        // These cause fast ERR responses from whisper_server
+        val stripped = text.trim().removeSurrounding("(", ")")
+            .removeSurrounding("[", "]").trim()
+        if (text.trim().matches(Regex("^[\[(].*[\])]$")) ||
+            stripped.lowercase() in setOf("music", "singing", "applause",
+                "laughter", "cheering", "instrumental", "song", "♪", "🎵")) {
+            CaptionLogger.log(TAG, "SKIP music annotation: $text")
+            return
+        }
+
         // If this text is just a longer version of what's already queued (LC growth),
         // remove the shorter version from queue — it will be superseded
         if (n.startsWith(lastEnqueued) && lastEnqueued.length > 10) {
@@ -468,8 +479,7 @@ class LiveCaptionReader : AccessibilityService() {
                 val text = item.text
                 val ageMs = System.currentTimeMillis() - item.enqMs
 
-                // Note: seq < expectedSeq check removed for 2-worker mode
-                // Both workers deliver results; TTS queue handles ordering
+                if (seq < expectedSeq) { CaptionLogger.log(TAG, "STALE $seq"); continue }
                 // Drop sentences that waited too long — speaker has moved on
                 if (ageMs > 15_000L) {
                     CaptionLogger.log(TAG, "EXPIRED $seq age=${ageMs/1000}s")
@@ -481,11 +491,13 @@ class LiveCaptionReader : AccessibilityService() {
                 val result = callServer(text)
                 val ms     = System.currentTimeMillis() - t0
 
-                // Only drop if truly too slow (>10s) — don't discard parallel worker results
-                if (ms > 10_000L) {
-                    CaptionLogger.log(TAG, "DISCARD-SLOW $seq ${ms}ms")
+                // Drop if translation took >8s AND newer captions have arrived (stale)
+                if (ms > 8_000L && seq < expectedSeq) {
+                    CaptionLogger.log(TAG, "DISCARD-SLOW $seq ${ms}ms (too old)")
                     continue
                 }
+
+                if (seq < expectedSeq) { CaptionLogger.log(TAG, "DISCARD $seq ${ms}ms"); continue }
 
                 if (result == null) {
                     errCount.incrementAndGet()
