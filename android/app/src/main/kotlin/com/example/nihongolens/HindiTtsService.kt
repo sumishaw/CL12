@@ -100,7 +100,8 @@ object HindiTtsService {
     data class FetchItem(
         val text: String, val gender: String, val speed: Float,
         val volume: Float = 1.0f, val pitchSlope: String = "flat",
-        val srcText: String = "", val emotion: Emotion = Emotion.NEUTRAL
+        val srcText: String = "", val emotion: Emotion = Emotion.NEUTRAL,
+        val bgSeq: Int = 0   // background audio seq number at enqueue time
     )
     data class PlayItem (val text: String, val wav: ByteArray, val durMs: Long)
 
@@ -196,10 +197,13 @@ object HindiTtsService {
 
         // FIFO: never drop sentences — every sentence gets spoken in order
         // fetchQueue is unbounded LinkedBlockingQueue so memory is safe
+        // Snapshot background audio sequence number at THIS moment
+        // Server will retrieve the BG chunk captured at this exact time
+        val bgSeq = BackgroundMusicRecorder.currentSeq.get()
         fetchQueue.offer(FetchItem(
             text=n, gender=genderTag, speed=speed,
             volume=volume, pitchSlope=pitchSlope,
-            srcText=srcText, emotion=emotion
+            srcText=srcText, emotion=emotion, bgSeq=bgSeq
         ))
     }
 
@@ -294,7 +298,8 @@ object HindiTtsService {
                     "&speed=${String.format("%.3f", item.speed)}" +
                     "&emotion=${item.emotion.name}" +
                     "&volume=${String.format("%.3f", item.volume)}" +
-                    "&pitch_slope=${item.pitchSlope}"
+                    "&pitch_slope=${item.pitchSlope}" +
+                    "&bg_seq=${item.bgSeq}"
                 CaptionLogger.log("HindiTTS", "[${item.emotion.name}/${item.emotion.category}] " +
                     "spd=${String.format("%.2f",item.speed)} " +
                     "vol=${String.format("%.2f",item.volume)} slope=${item.pitchSlope}")
