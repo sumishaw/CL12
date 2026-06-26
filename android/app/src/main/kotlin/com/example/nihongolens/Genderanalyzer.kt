@@ -11,57 +11,65 @@ import kotlinx.coroutines.*
 import kotlin.math.*
 
 /**
- * GenderAnalyzer v9 — Gender + Emotion detection from USAGE_MEDIA internal audio.
+ * GenderAnalyzer v8 — USAGE_MEDIA internal audio capture + YIN pitch detection.
  *
- * Uses AudioPlaybackCaptureConfiguration(USAGE_MEDIA) — pure internal audio.
- * No mic. Works with speakers and headphones.
- * Hindi TTS (USAGE_ASSISTANT) excluded at Android audio mixer level.
+ * ONLY uses AudioPlaybackCaptureConfiguration(USAGE_MEDIA).
+ * - Captures the media player digital audio stream directly from Android's audio mixer
+ * - Works with speakers AND headphones (capture happens before output device)
+ * - Zero mic usage — no ambient noise, no room acoustics
+ * - Hindi TTS (USAGE_ASSISTANT) is excluded at the OS level — never analyzed
  *
- * Detects 23 emotion/voice types via 5 acoustic features per 128ms window.
- * Sets HindiTtsService.currentEmotion → TTS server applies speed+pitch.
+ * Requires: MediaProjection from SpeechCaptureService.sharedProjection
+ * The projection is obtained via the normal screen capture permission dialog
+ * which SpeechCaptureService already handles.
  */
 object GenderAnalyzer {
 
-    private const val TAG        = "GenderAnalyzer"
-    private const val SR         = 16_000
-    private const val WIN        = 2048
-    private const val F0_FEMALE  = 165f
-    private const val YIN_THRESH = 0.25f
-    private const val RMS_FLOOR  = 80f
-    private const val HIST       = 3
+    private const val TAG          = "GenderAnalyzer"
+    private const val SR           = 16_000
+    private const val WIN          = 2048        // 128ms window
+    private const val F0_FEMALE    = 165f        // Hz — above = female
+    private const val YIN_THRESH   = 0.22f   // stricter — rejects music/noise better
+    private const val RMS_FLOOR    = 80f         // out of 32768 — skip silence
+    private const val HIST         = 6   // needs 4/6 majority — prevents music-induced flicker
 
     @Volatile var enabled    = false
     @Volatile var lastStatus = "waiting for screen capture permission"
-    @Volatile var detectedEmotion: HindiTtsService.Emotion = HindiTtsService.Emotion.NEUTRAL
 
-    private val history       = ArrayDeque<HindiTtsService.Gender>()
-    private val emotionHistory = ArrayDeque<HindiTtsService.Emotion>()
-    private val accum         = ShortArray(WIN)
-    private var accumFill     = 0
+    private val history   = ArrayDeque<HindiTtsService.Gender>()
+    private val accum     = ShortArray(WIN)
+    private var accumFill = 0
 
-    private val scope     = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var captureJob: Job?        = null
+    private val scope       = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var captureJob: Job?         = null
     private var captureRec: AudioRecord? = null
 
-    private var prevF0     = 0f
-    private var f0History  = FloatArray(8)
-    private var f0HistIdx  = 0
-    private var frameCount = 0
+    private var frameCount   = 0
     private var analyzeCount = 0
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
+    /**
+     * Start internal audio capture for gender detection.
+     * Must be called with a valid MediaProjection from SpeechCaptureService.
+     */
     fun start(projection: MediaProjection? = null) {
-        if (enabled) return
+        if (enabled) {
+            CaptionLogger.log(TAG, "already running — skipping start()")
+            return
+        }
         if (projection == null) {
             lastStatus = "no projection — grant screen capture permission"
-            CaptionLogger.log(TAG, "start() — no projection")
+            CaptionLogger.log(TAG, "start() called but projection=null — need screen capture permission")
             return
         }
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            lastStatus = "API < Q — not supported"; return
+            lastStatus = "API < Q — AudioPlaybackCapture not supported"
+            CaptionLogger.log(TAG, "API < Q — cannot use AudioPlaybackCaptureConfiguration")
+            return
         }
         stop()
+        CaptionLogger.log(TAG, "start() — creating USAGE_MEDIA AudioPlaybackCaptureConfiguration")
         captureJob = scope.launch { captureLoop(projection) }
     }
 
@@ -71,7 +79,7 @@ object GenderAnalyzer {
         try { captureRec?.stop()    } catch (_: Exception) {}
         try { captureRec?.release() } catch (_: Exception) {}
         captureRec = null
-        history.clear(); emotionHistory.clear()
+        history.clear()
         accumFill = 0
         if (lastStatus != "waiting for screen capture permission")
             CaptionLogger.log(TAG, "stopped")
@@ -81,14 +89,16 @@ object GenderAnalyzer {
 
     @androidx.annotation.RequiresApi(Build.VERSION_CODES.Q)
     private suspend fun captureLoop(projection: MediaProjection) = withContext(Dispatchers.IO) {
+        // USAGE_MEDIA = video/music player stream ONLY
+        // USAGE_ASSISTANT (Hindi TTS) is NOT listed → excluded at OS audio mixer level
         val config = try {
             AudioPlaybackCaptureConfiguration.Builder(projection)
                 .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
                 .build()
         } catch (e: Exception) {
             enabled = false
-            lastStatus = "config failed: ${e.message}"
-            CaptionLogger.log(TAG, "config failed: ${e.message}")
+            lastStatus = "capture config failed: ${e.message}"
+            CaptionLogger.log(TAG, "AudioPlaybackCaptureConfiguration failed: ${e.message}")
             return@withContext
         }
 
@@ -109,18 +119,21 @@ object GenderAnalyzer {
         } catch (e: Exception) {
             enabled = false
             lastStatus = "AudioRecord failed: ${e.message}"
-            CaptionLogger.log(TAG, "AudioRecord failed: ${e.message}")
+            CaptionLogger.log(TAG, "AudioRecord.Builder failed: ${e.message}")
             return@withContext
         }
 
         if (rec.state != AudioRecord.STATE_INITIALIZED) {
-            enabled = false; rec.release()
-            lastStatus = "AudioRecord state=${rec.state}"
-            CaptionLogger.log(TAG, "AudioRecord not initialized")
+            enabled = false
+            rec.release()
+            lastStatus = "AudioRecord state=${rec.state} — not initialized"
+            CaptionLogger.log(TAG, "AudioRecord not initialized state=${rec.state}")
             return@withContext
         }
 
-        captureRec = rec; enabled = true
+        captureRec = rec
+        enabled    = true
+        frameCount = 0; analyzeCount = 0
         lastStatus = "capturing USAGE_MEDIA SR=${SR}Hz"
         rec.startRecording()
         CaptionLogger.log(TAG, ">>> INTERNAL AUDIO CAPTURE STARTED SR=${SR}Hz <<<")
@@ -134,15 +147,19 @@ object GenderAnalyzer {
                     n > 0 -> {
                         readCount++
                         if (readCount == 1)
-                            CaptionLogger.log(TAG, "FIRST read: $n bytes — media audio flowing!")
+                            CaptionLogger.log(TAG, "FIRST internal audio read: $n bytes — media audio flowing!")
                         ingest(buf, n)
                     }
-                    n < 0 -> { CaptionLogger.log(TAG, "read error=$n"); break }
+                    n < 0 -> {
+                        CaptionLogger.log(TAG, "read error=$n — stopping")
+                        break
+                    }
                 }
             }
         } finally {
             try { rec.stop(); rec.release() } catch (_: Exception) {}
-            captureRec = null; enabled = false
+            captureRec = null
+            enabled = false
             CaptionLogger.log(TAG, "captureLoop ended reads=$readCount")
         }
     }
@@ -160,20 +177,26 @@ object GenderAnalyzer {
         }
     }
 
-    // ── YIN + emotion feature extraction ─────────────────────────────────────
+    // ── YIN pitch detection ───────────────────────────────────────────────────
 
     private fun analyze() {
         analyzeCount++
 
+        // RMS — skip silence
         var energy = 0.0
         for (s in accum) energy += s.toLong() * s
         val rms = sqrt(energy / WIN).toFloat()
-        if (rms < RMS_FLOOR) return
+        if (rms < RMS_FLOOR) {
+            if (analyzeCount % 30 == 0)
+                CaptionLogger.log(TAG, "silent rms=${rms.toInt()} floor=$RMS_FLOOR analyzed=$analyzeCount")
+            return
+        }
 
         val tauMin = (SR / 300).coerceAtLeast(1)
         val tauMax = (SR / 60).coerceAtMost(WIN / 2 - 1)
         val half   = WIN / 2
 
+        // YIN difference function — raw PCM, no windowing
         val d = FloatArray(tauMax + 1)
         for (tau in 1..tauMax) {
             var s = 0f
@@ -184,135 +207,53 @@ object GenderAnalyzer {
             d[tau] = s
         }
 
-        val c = FloatArray(tauMax + 1); c[0] = 1f; var rs = 0f
+        // CMNDF
+        val c = FloatArray(tauMax + 1); c[0] = 1f
+        var rs = 0f
         for (tau in 1..tauMax) {
             rs += d[tau]
             c[tau] = if (rs > 0f) d[tau] * tau / rs else 1f
         }
 
+        // First dip below threshold
         var tau = tauMin
-        var minCmndf = 1f
         while (tau < tauMax - 1) {
-            if (c[tau] < minCmndf) minCmndf = c[tau]
             if (c[tau] < YIN_THRESH) {
                 val best = if (tau + 1 < tauMax && c[tau + 1] < c[tau]) tau + 1 else tau
-                val f0   = SR.toFloat() / best
-                val hnr  = 1f - minCmndf
-                onPitch(f0, rms, hnr)
+                onPitch(SR.toFloat() / best, rms)
                 return
             }
             tau++
         }
 
-        prevF0 = 0f
+        if (analyzeCount % 15 == 0) {
+            var mv = 1f; var mt = tauMin
+            for (t in tauMin until tauMax) if (c[t] < mv) { mv = c[t]; mt = t }
+            CaptionLogger.log(TAG, "noPitch rms=${rms.toInt()} minCMNDF=${"%.3f".format(mv)} f0est=${SR/mt}Hz thr=$YIN_THRESH")
+        }
     }
 
-    // ── Gender + Emotion classification ──────────────────────────────────────
-
-    private fun onPitch(f0: Float, rms: Float, hnr: Float) {
+    private fun onPitch(f0: Float, rms: Float) {
         frameCount++
-
-        // GENDER
         val gender = if (f0 >= F0_FEMALE) HindiTtsService.Gender.FEMALE
                      else                  HindiTtsService.Gender.MALE
-        history.addLast(gender)
-        if (history.size > HIST) history.removeFirst()
-        val fCount   = history.count { it == HindiTtsService.Gender.FEMALE }
-        val majGender = if (fCount > history.size / 2) HindiTtsService.Gender.FEMALE
-                        else                            HindiTtsService.Gender.MALE
-        if (majGender != HindiTtsService.detectedGender) {
-            HindiTtsService.detectedGender = majGender
-            HindiTtsService.spokenTokens.clear()
-            lastStatus = "MEDIA audio → $majGender (F0=${f0.toInt()}Hz)"
-            CaptionLogger.log(TAG, ">>> Gender SWITCHED to $majGender F0=${f0.toInt()}Hz <<<")
-        }
-
-        // EMOTION FEATURES
-        val f0Slope = if (prevF0 > 0f) (f0 - prevF0) / prevF0 else 0f
-        prevF0 = f0
-
-        f0History[f0HistIdx % f0History.size] = f0; f0HistIdx++
-        val validF0  = f0History.filter { it > 0f }
-        val f0Mean   = if (validF0.isEmpty()) f0 else validF0.average().toFloat()
-        val f0Jitter = if (validF0.size < 2) 0f else
-            validF0.map { abs(it - f0Mean) }.average().toFloat() / f0Mean.coerceAtLeast(1f)
-        val rmsNorm  = (rms / 3000f).coerceIn(0f, 3f)
-
-        // EMOTION RULES — 23 types, priority: rhythmic > intense > breathive > warm > basic
-        val emotion: HindiTtsService.Emotion = when {
-            // Rhythmic & Expressive
-            f0Slope > 0.20f && rmsNorm > 1.5f && f0Jitter > 0.15f ->
-                HindiTtsService.Emotion.GASPING
-            f0Jitter > 0.18f && rmsNorm > 1.0f && f0 > f0Mean * 1.02f ->
-                HindiTtsService.Emotion.PANTING
-            f0 < f0Mean * 0.85f && f0Jitter < 0.06f && rmsNorm in 0.3f..1.0f && hnr > 0.4f ->
-                HindiTtsService.Emotion.MOANING
-            f0Slope < -0.12f && rmsNorm < 0.6f && hnr > 0.3f ->
-                HindiTtsService.Emotion.SIGHING
-            // Intense & Physiological
-            f0 > f0Mean * 1.12f && rmsNorm > 1.3f && f0Jitter > 0.10f && hnr < 0.5f ->
-                HindiTtsService.Emotion.STRAINED
-            f0 < f0Mean * 0.80f && hnr < 0.30f && f0Jitter > 0.10f ->
-                HindiTtsService.Emotion.GRAVELLY
-            hnr < 0.35f && rmsNorm > 1.0f && f0Jitter > 0.08f ->
-                HindiTtsService.Emotion.RASPY
-            hnr < 0.45f && rmsNorm in 0.7f..1.5f && f0Jitter in 0.05f..0.12f ->
-                HindiTtsService.Emotion.HUSKY
-            // Basic high-energy
-            f0Slope > 0.15f && rmsNorm > 0.8f ->
-                HindiTtsService.Emotion.SURPRISED
-            rmsNorm > 1.4f && hnr < 0.5f ->
-                HindiTtsService.Emotion.ANGRY
-            f0 > f0Mean * 1.05f && f0Jitter > 0.12f ->
-                HindiTtsService.Emotion.FEARFUL
-            // Breathive & Low-Intensity
-            rmsNorm < 0.25f && hnr < 0.25f ->
-                HindiTtsService.Emotion.WHISPERY
-            f0 < f0Mean * 0.88f && rmsNorm < 0.4f && hnr < 0.4f ->
-                HindiTtsService.Emotion.MURMURED
-            rmsNorm < 0.35f && hnr < 0.40f && f0Jitter < 0.06f ->
-                HindiTtsService.Emotion.HUSHED
-            hnr < 0.40f && rmsNorm in 0.2f..0.8f && f0Jitter < 0.07f ->
-                HindiTtsService.Emotion.BREATHY
-            // Warm & Affectionate
-            f0 < f0Mean * 0.92f && hnr > 0.65f && f0Jitter < 0.05f && rmsNorm < 0.9f ->
-                HindiTtsService.Emotion.SULTRY
-            rmsNorm < 0.45f && hnr > 0.60f && f0Jitter < 0.05f ->
-                HindiTtsService.Emotion.TENDER
-            f0 < f0Mean * 0.97f && hnr > 0.70f && f0Jitter < 0.04f ->
-                HindiTtsService.Emotion.VELVETY
-            hnr > 0.65f && f0Jitter < 0.05f && rmsNorm in 0.4f..1.1f ->
-                HindiTtsService.Emotion.WARM
-            // Basic emotional states
-            f0 > f0Mean * 1.08f && f0Jitter < 0.08f && rmsNorm > 0.6f && hnr > 0.6f ->
-                HindiTtsService.Emotion.HAPPY
-            f0 < f0Mean * 0.93f && abs(f0Slope) < 0.05f && rmsNorm < 0.7f ->
-                HindiTtsService.Emotion.SAD
-            f0Slope < -0.10f && rmsNorm < 0.9f && hnr < 0.45f ->
-                HindiTtsService.Emotion.DISGUST
-            else -> HindiTtsService.Emotion.NEUTRAL
-        }
-
-        // Smooth over 5 frames
-        emotionHistory.addLast(emotion)
-        if (emotionHistory.size > 5) emotionHistory.removeFirst()
-        val counts = emotionHistory.groupingBy { it }.eachCount()
-        val smoothed: HindiTtsService.Emotion = counts.maxByOrNull { it.value }?.key
-            ?: HindiTtsService.Emotion.NEUTRAL
-
-        if (smoothed != detectedEmotion) {
-            detectedEmotion = smoothed
-            HindiTtsService.currentEmotion = smoothed
-            CaptionLogger.log(TAG, "Emotion→${smoothed.name}[${smoothed.category}] " +
-                "F0=${f0.toInt()}Hz slope=${f0Slope.fmt()} jitter=${f0Jitter.fmt()} " +
-                "rms=${rmsNorm.fmt()} hnr=${hnr.fmt()} " +
-                "spd=${smoothed.speedMult} pch=${smoothed.pitchMult}")
-        }
 
         if (frameCount % 5 == 0)
-            CaptionLogger.log(TAG, "PITCH F0=${f0.toInt()}Hz → $gender | ${smoothed.name} " +
-                "spd=${smoothed.speedMult} pch=${smoothed.pitchMult}")
-    }
+            CaptionLogger.log(TAG, "PITCH F0=${f0.toInt()}Hz rms=${rms.toInt()} → $gender")
 
-    private fun Float.fmt() = String.format("%.2f", this)
+        history.addLast(gender)
+        if (history.size > HIST) history.removeFirst()
+
+        val fCount = history.count { it == HindiTtsService.Gender.FEMALE }
+        val maj    = if (fCount > history.size / 2) HindiTtsService.Gender.FEMALE
+                     else                            HindiTtsService.Gender.MALE
+
+        if (maj != HindiTtsService.detectedGender) {
+            HindiTtsService.detectedGender = maj
+            HindiTtsService.spokenTokens.clear()
+            lastStatus = "MEDIA audio → $maj (F0=${f0.toInt()}Hz)"
+            CaptionLogger.log(TAG, ">>> Gender SWITCHED to $maj F0=${f0.toInt()}Hz <<<")
+            Log.d(TAG, "Gender→$maj F0=${f0.toInt()} rms=${rms.toInt()}")
+        }
+    }
 }
