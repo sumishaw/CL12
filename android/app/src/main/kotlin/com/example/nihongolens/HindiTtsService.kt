@@ -299,8 +299,8 @@ object HindiTtsService {
                     "spd=${String.format("%.2f",item.speed)} " +
                     "vol=${String.format("%.2f",item.volume)} slope=${item.pitchSlope}")
                 conn = URL(url).openConnection() as HttpURLConnection
-                conn.connectTimeout = 5_000
-                conn.readTimeout    = 20_000
+                conn.connectTimeout = 8_000
+                conn.readTimeout    = 40_000  // increased — Piper synthesis can take time
                 if (conn.responseCode == 200) conn.inputStream.readBytes() else null
             } catch (e: Exception) { null }
             finally { try { conn?.disconnect() } catch (_: Exception) {} }
