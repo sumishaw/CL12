@@ -99,10 +99,8 @@ object GenderAnalyzer {
     private var bgVolume       = 0.35f     // normal BG volume (35%)
     private var bgDucked       = false
 
-    companion object {
-        const val BG_VOLUME_NORMAL = 0.35f   // background when no TTS
-        const val BG_VOLUME_DUCKED = 0.10f   // background during TTS speech
-    }
+    private const val BG_VOLUME_NORMAL = 0.35f   // background when no TTS
+    private const val BG_VOLUME_DUCKED = 0.10f   // background during TTS speech
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
