@@ -229,7 +229,7 @@ class MainActivity : FlutterActivity() {
         }
         // Restart GenderAnalyzer if it stopped (e.g. app was backgrounded)
         if (!GenderAnalyzer.enabled) {
-            GenderAnalyzer.start()
+            GenderAnalyzer.start(context = applicationContext)
         }
     }
 
@@ -310,7 +310,7 @@ class MainActivity : FlutterActivity() {
         mainHandler.post {
             methodChannel?.invokeMethod("onLiveCaptionReaderConnected", null)
             // Start GenderAnalyzer using Visualizer API — no projection needed, safe to call anytime
-            if (!GenderAnalyzer.enabled) GenderAnalyzer.start()
+            if (!GenderAnalyzer.enabled) GenderAnalyzer.start(context = applicationContext)
         }
     }
 
