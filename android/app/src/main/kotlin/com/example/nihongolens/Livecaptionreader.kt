@@ -418,17 +418,14 @@ class LiveCaptionReader : AccessibilityService() {
             return
         }
 
-        // Skip music/sound annotations — they have no translatable speech content
-        // These cause fast ERR responses from whisper_server
-        val stripped = text.trim().removeSurrounding("(", ")")
-            .removeSurrounding("[", "]").trim()
-        val trimmed = text.trim()
-        val isAnnotation = (trimmed.startsWith("(") && trimmed.endsWith(")")) ||
-                           (trimmed.startsWith("[") && trimmed.endsWith("]"))
-        if (isAnnotation ||
-            stripped.lowercase() in setOf("music", "singing", "applause",
-                "laughter", "cheering", "instrumental", "song")) {
-            CaptionLogger.log(TAG, "SKIP music annotation: $text")
+        // Skip pure music/sound annotations — no translatable content
+        val tr = text.trim()
+        val isAnnotation = (tr.startsWith("(") && tr.endsWith(")")) ||
+                           (tr.startsWith("[") && tr.endsWith("]"))
+        val stripped = tr.removeSurrounding("(", ")").removeSurrounding("[", "]").trim().lowercase()
+        if (isAnnotation && stripped in setOf("music", "singing", "applause",
+                "laughter", "cheering", "instrumental", "song", "sound effects")) {
+            CaptionLogger.log(TAG, "SKIP annotation: $tr")
             return
         }
 
@@ -484,7 +481,7 @@ class LiveCaptionReader : AccessibilityService() {
 
                 if (seq < expectedSeq) { CaptionLogger.log(TAG, "STALE $seq"); continue }
                 // Drop sentences that waited too long — speaker has moved on
-                if (ageMs > 15_000L) {
+                if (ageMs > 6_000L) {
                     CaptionLogger.log(TAG, "EXPIRED $seq age=${ageMs/1000}s")
                     continue
                 }
@@ -533,7 +530,13 @@ class LiveCaptionReader : AccessibilityService() {
                 // Gender detection is audio-only (GenderAnalyzer.kt) — no pronoun detection
                 // Pass English source text for feminine verb form hints (she/her → ती/ी)
                 // This ONLY affects verb conjugation, NOT voice switching
-                HindiTtsService.speak(hindi, text)
+                // Only speak if sentence is still fresh (< 5s since enqueue)
+                val speakAge = System.currentTimeMillis() - item.enqMs
+                if (speakAge < 5_000L) {
+                    HindiTtsService.speak(hindi, text)
+                } else {
+                    CaptionLogger.log(TAG, "SKIP-STALE TTS $seq age=${speakAge/1000}s")
+                }
         }
     }
 
