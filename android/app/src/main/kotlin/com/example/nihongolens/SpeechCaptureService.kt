@@ -161,7 +161,7 @@ class SpeechCaptureService : Service() {
         if (genderOnly) {
             updateNotification("Voice gender detection active")
             CaptionLogger.log("SCS", "gender-only mode — starting GenderAnalyzer with projection")
-            GenderAnalyzer.start(sharedProjection)
+            GenderAnalyzer.start(sharedProjection, this.applicationContext)
             return START_STICKY   // stay alive to keep projection valid
         }
 
@@ -265,7 +265,7 @@ class SpeechCaptureService : Service() {
         capturing.set(true)
         ar.startRecording()
         // Start GenderAnalyzer with dedicated USAGE_MEDIA capture (separate from our capture)
-        GenderAnalyzer.start(sharedProjection)
+        GenderAnalyzer.start(sharedProjection, this.applicationContext)
         updateNotification("Translating video audio to Hindi…")
         mainHandler.post { OverlayService.updateText("", "") }
 
