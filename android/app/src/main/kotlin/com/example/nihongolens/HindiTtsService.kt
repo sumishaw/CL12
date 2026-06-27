@@ -75,7 +75,14 @@ object HindiTtsService {
     private var focusRequest: android.media.AudioFocusRequest? = null
 
     // ── FIFO queues (unbounded — never drop sentences) ────────────────────────
-    data class FetchItem(val text: String, val gender: String, val speed: Float, val srcText: String = "")
+    data class FetchItem(
+        val text: String,
+        val gender: String,
+        val speed: Float,
+        val srcText: String = "",
+        val emotion: Emotion = Emotion.NEUTRAL,
+        val enqMs: Long = System.currentTimeMillis()
+    )
     data class PlayItem (val text: String, val wav: ByteArray, val durMs: Long)
 
     private val fetchQueue = LinkedBlockingQueue<FetchItem>()
@@ -148,17 +155,13 @@ object HindiTtsService {
 
         val emotion = detectEmotion(n)
         val speed   = (emotionSpeed(emotion) * ttsSpeedMultiplier).coerceIn(0.5f, 4.0f)
-        // Always store "auto" — gender resolved at fetch time so switches apply immediately
-        // even for sentences already in queue
         val genderTag = when (selectedGender) {
             Gender.FEMALE -> "female"
             Gender.MALE   -> "male"
-            Gender.AUTO   -> "auto"   // resolved in fetchWorker to catch late gender switches
+            Gender.AUTO   -> "auto"
         }
-
-        // FIFO: never drop sentences — every sentence gets spoken in order
-        // fetchQueue is unbounded LinkedBlockingQueue so memory is safe
-        fetchQueue.offer(FetchItem(n, genderTag, speed, srcText))
+        CaptionLogger.log(TAG, "SPEAK emo=$emotion spd=${"%.2f".format(speed)} '${n.take(50)}'")
+        fetchQueue.offer(FetchItem(n, genderTag, speed, srcText, emotion, System.currentTimeMillis()))
     }
 
 
@@ -172,36 +175,54 @@ object HindiTtsService {
             while (isActive) {
                 val item = fetchQueue.take()   // blocks — never misses
                 if (!enabled) continue
+
+                // STALE GUARD: if sentence has been waiting >8s, skip it
+                // (speaker has moved on; playing old audio is confusing)
+                val ageMs = System.currentTimeMillis() - item.enqMs
+                if (ageMs > 8_000L) {
+                    CaptionLogger.log(TAG, "TTS-SKIP stale ${ageMs/1000}s '${item.text.take(30)}'")
+                    continue
+                }
+
+                // QUEUE OVERLOAD: if more than 2 items waiting, skip to latest
+                // Prevents speaking a 30-second backlog of old sentences
+                if (fetchQueue.size > 2) {
+                    CaptionLogger.log(TAG, "TTS-SKIP overloaded q=${fetchQueue.size+1}, going to latest")
+                    continue
+                }
+
                 try {
-                    // Resolve gender at fetch time — captures latest GenderAnalyzer result
-                    // ONLY GenderAnalyzer (audio pitch) sets detectedGender.
-                    // Pronouns in source text NEVER change the voice — only verb forms.
                     val resolvedGender = if (item.gender == "auto")
                         if (detectedGender == Gender.FEMALE) "female" else "male"
                     else item.gender
 
-                    // Verb form gender: audio gender takes priority.
-                    // If audio says male but text has "she/her" → still use male voice
-                    // but DO apply feminine verb conjugation for accuracy.
                     val verbGender = when {
-                        resolvedGender == "female" -> "female"           // audio says female
-                        hasFemininePronouns(item.srcText) -> "female"    // text hint only → verbs
+                        resolvedGender == "female" -> "female"
+                        hasFemininePronouns(item.srcText) -> "female"
                         else -> "male"
                     }
                     val textToSpeak = if (verbGender == "female")
                         toFeminineHindi(item.text) else item.text
 
-                    val wav = fetchWav(textToSpeak, resolvedGender, item.speed)
+                    val t0 = System.currentTimeMillis()
+                    val wav = fetchWav(textToSpeak, resolvedGender, item.speed, item.emotion)
+                    val fetchMs = System.currentTimeMillis() - t0
+
                     if (wav != null && wav.size > 44) {
                         val sr  = readInt(wav, 24).coerceAtLeast(8_000)
                         val nch = readShort(wav, 22).coerceAtLeast(1)
                         val bit = readShort(wav, 34).coerceAtLeast(8)
                         val dur = ((wav.size - 44).toLong() * 1000) / (sr.toLong() * nch * (bit / 8))
+                        CaptionLogger.log(TAG, "TTS-WAV ${fetchMs}ms ${dur}ms ${resolvedGender} '${textToSpeak.take(40)}'")
                         playQueue.offer(PlayItem(item.text, wav, dur))
                     } else {
-                        Log.w(TAG, "Empty WAV — is hindi_tts_server.py running? Start: python3 ~/hindi_tts_server.py &")
+                        CaptionLogger.log(TAG, "TTS-ERR ${fetchMs}ms — server returned null/empty WAV")
+                        Log.w(TAG, "Empty WAV — is hindi_tts_server2.py running on port 8766?")
                     }
-                } catch (e: Exception) { Log.e(TAG, "Fetch: ${e.message}") }
+                } catch (e: Exception) {
+                    CaptionLogger.log(TAG, "TTS-EXC ${e.javaClass.simpleName}: ${e.message}")
+                    Log.e(TAG, "Fetch: ${e.message}")
+                }
             }
         }
     }
@@ -215,19 +236,17 @@ object HindiTtsService {
                 if (!enabled) continue
                 try {
                     isSpeaking = true
-                    // No audio focus request — USAGE_ASSISTANT handles exclusion from LC
-                    // AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE was pausing video → LC gap → loop
+                    CaptionLogger.log(TAG, "PLAY ${item.durMs}ms '${item.text.take(40)}'")
                     withContext(Dispatchers.Main) {
-                        // Sync subtitle to exactly what is being spoken (FIFO display)
                         OverlayService.showTtsText(item.text)
                     }
                     playWav(item.wav, item.durMs)
                     withContext(Dispatchers.Main) {
-                        // TTS finished — advance subtitle to next queued item
                         OverlayService.clearTtsText()
                     }
                     speakingUntilMs = System.currentTimeMillis() + 300L
                 } catch (e: Exception) {
+                    CaptionLogger.log(TAG, "PLAY-ERR ${e.message}")
                     Log.e(TAG, "Play: ${e.message}")
                 } finally {
                     isSpeaking = false
@@ -238,17 +257,25 @@ object HindiTtsService {
 
     // ── HTTP fetch ────────────────────────────────────────────────────────────
 
-    private suspend fun fetchWav(text: String, gender: String, speed: Float): ByteArray? =
+    private suspend fun fetchWav(text: String, gender: String, speed: Float, emotion: Emotion = Emotion.NEUTRAL): ByteArray? =
         withContext(Dispatchers.IO) {
             var conn: HttpURLConnection? = null
             try {
                 val enc = java.net.URLEncoder.encode(text, "UTF-8")
-                conn = URL("$TTS_URL?text=$enc&gender=$gender&speed=$speed")
+                val emoStr = emotion.name  // e.g. "WARM", "FEARFUL", "NEUTRAL"
+                // Pass bg_seq from GenderAnalyzer for server-side BG audio sync
+                conn = URL("$TTS_URL?text=$enc&gender=$gender&speed=$speed&emo=$emoStr")
                     .openConnection() as HttpURLConnection
                 conn.connectTimeout = 5_000
-                conn.readTimeout    = 20_000
-                if (conn.responseCode == 200) conn.inputStream.readBytes() else null
-            } catch (e: Exception) { null }
+                conn.readTimeout    = 12_000   // Piper sherpa-onnx is fast (~200ms); 12s covers cold starts
+                if (conn.responseCode == 200) conn.inputStream.readBytes() else {
+                    Log.w(TAG, "TTS HTTP ${conn.responseCode}")
+                    null
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "fetchWav: ${e.javaClass.simpleName}: ${e.message}")
+                null
+            }
             finally { try { conn?.disconnect() } catch (_: Exception) {} }
         }
 
