@@ -54,9 +54,11 @@ class OverlayService : Service() {
 
         fun updateText(original: String, hindi: String) {
             latestOriginal = original; latestHindi = hindi
-            // Always update subtitle immediately when translation arrives
-            // TTS plays asynchronously — subtitle and TTS run in parallel
-            instance?.handler?.post { instance?.onNewHindi(hindi) }
+            // FIFO TOKEN MODE: Subtitle display is now driven by HindiTtsService play worker.
+            // updateText() only stores the latest values for polling (Flutter UI, SpeechCaptureService).
+            // Livecaptionreader no longer calls this to show subtitles — it calls HindiTtsService.speak()
+            // which queues for synthesis, and the play worker calls showTtsText() right before audio plays.
+            // DO NOT call onNewHindi() here — that would show subtitle before/without audio.
         }
 
         // Called by TTS play worker when it STARTS speaking a sentence.
