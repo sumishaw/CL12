@@ -43,7 +43,20 @@ object HindiTtsService {
     private const val GENDER_URL = "http://127.0.0.1:8765/gender"
 
     enum class Gender  { AUTO, MALE, FEMALE }
-    enum class Emotion { NEUTRAL, HAPPY, SAD, ANGRY, EXCITED, CURIOUS }
+    // Extended emotion enum — covers all 26 emotions detected by GenderAnalyzer
+    // The 6 original + 20 new ones referenced in Genderanalyzer.kt
+    enum class Emotion {
+        NEUTRAL, HAPPY, SAD, ANGRY, EXCITED, CURIOUS,
+        // Voice texture emotions (used by GenderAnalyzer acoustic analysis)
+        WARM, FEARFUL, SURPRISED, SIGHING,
+        SINGING, GASPING, PANTING, MOANING,
+        STRAINED, GRAVELLY, RASPY, HUSKY,
+        WHISPERY, MURMURED, HUSHED, BREATHY,
+        SULTRY, TENDER, VELVETY, DISGUST
+    }
+
+    // Current emotion detected by GenderAnalyzer — updated externally, read by speak()
+    @Volatile var currentEmotion: Emotion = Emotion.NEUTRAL
 
     // FIX: enabled = true by default.
     // Was false — requiring user to manually toggle in Flutter UI settings panel.
@@ -429,6 +442,11 @@ object HindiTtsService {
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private fun detectEmotion(t: String): Emotion {
+        // Prefer GenderAnalyzer's audio-derived emotion when it's not NEUTRAL
+        // (audio emotion is more accurate than text heuristics)
+        if (currentEmotion != Emotion.NEUTRAL) return currentEmotion
+
+        // Fallback: text-based detection
         if (t.endsWith("!") || t.endsWith("！")) return Emotion.EXCITED
         if (t.endsWith("?") || t.endsWith("？")) return Emotion.CURIOUS
         val l = t.lowercase()
@@ -439,9 +457,32 @@ object HindiTtsService {
     }
 
     private fun emotionSpeed(e: Emotion) = when (e) {
-        Emotion.EXCITED -> 1.10f; Emotion.HAPPY -> 1.05f
-        Emotion.CURIOUS -> 0.97f; Emotion.SAD   -> 0.88f
-        Emotion.ANGRY   -> 1.08f; else          -> 1.00f
+        Emotion.EXCITED    -> 1.10f
+        Emotion.HAPPY      -> 1.05f
+        Emotion.CURIOUS    -> 0.97f
+        Emotion.SAD        -> 0.88f
+        Emotion.ANGRY      -> 1.08f
+        Emotion.FEARFUL    -> 1.05f   // slightly faster — anxious pace
+        Emotion.SURPRISED  -> 1.08f
+        Emotion.WARM       -> 0.95f   // warm/calm — slightly slower
+        Emotion.SIGHING    -> 0.85f
+        Emotion.SINGING    -> 0.90f   // melodic pace
+        Emotion.GASPING    -> 1.15f   // rapid
+        Emotion.PANTING    -> 1.18f
+        Emotion.MOANING    -> 0.80f   // slow, drawn out
+        Emotion.STRAINED   -> 0.92f
+        Emotion.GRAVELLY   -> 0.95f
+        Emotion.RASPY      -> 0.97f
+        Emotion.HUSKY      -> 0.93f
+        Emotion.WHISPERY   -> 0.90f
+        Emotion.MURMURED   -> 0.88f
+        Emotion.HUSHED     -> 0.87f
+        Emotion.BREATHY    -> 0.92f
+        Emotion.SULTRY     -> 0.85f
+        Emotion.TENDER     -> 0.90f
+        Emotion.VELVETY    -> 0.88f
+        Emotion.DISGUST    -> 1.05f
+        else               -> 1.00f
     }
 
     private fun readInt(b: ByteArray, o: Int) =
