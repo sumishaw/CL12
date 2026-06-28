@@ -113,20 +113,22 @@ class LiveCaptionReader : AccessibilityService() {
         )
 
         // ── MINIMUM WORDS FOR TRANSLATION ────────────────────────────────────
-        // Don't translate fragments shorter than this — they're almost certainly incomplete.
-        // "So I" (2 words) = fragment. "So I think that" (4 words) = translatable clause.
-        private const val MIN_WORDS_HARD   = 3   // after hard punctuation
-        private const val MIN_WORDS_SOFT   = 6   // after soft punctuation (needs more context)
-        private const val MIN_WORDS_SILENCE = 3  // after silence gap
+        private const val MIN_WORDS_HARD    = 3   // after hard punctuation
+        private const val MIN_WORDS_SOFT    = 6   // after soft punctuation
+        private const val MIN_WORDS_SILENCE = 5   // after silence gap (raised from 3 → stops 3-word fragments)
 
-        // ── WORD-GROWTH THRESHOLD ─────────────────────────────────────────────
-        // LC grows sentences word by word. Translate only when:
-        // - sentence ends with punctuation (above), OR
-        // - silence gap passes, OR
-        // - sentence has grown significantly (15+ words, likely a long LC caption block)
-        // REMOVED: "translate every 5 new words" — this was the cause of partial translation!
-        // Now: only grow-based trigger at 15+ words total (run-on sentence safety net)
-        private const val MAX_WORDS_BEFORE_FORCE = 15
+        // ── FORCE / COOLDOWN THRESHOLDS ───────────────────────────────────────
+        // MAX_WORDS_BEFORE_FORCE: raised 15→20. At 15, a 60-word paragraph triggered
+        // FORCE every 6 words = 10 submissions of the same sentence → CT2 flood.
+        private const val MAX_WORDS_BEFORE_FORCE = 20
+
+        // FORCE_MIN_NEW_WORDS: raised 6→12. Previously wordsSinceSubmit=7 bypassed
+        // cooldown, causing same text to be submitted every 7 words (3s = 1+ per second).
+        private const val FORCE_MIN_NEW_WORDS = 12
+
+        // FORCE_COOLDOWN_MS: hard time-based lock after any FORCE submission.
+        // Even if 12 new words arrive in 1 second, don't force-submit again.
+        private const val FORCE_COOLDOWN_MS  = 5_000L
 
         private val LC_PACKAGES = setOf(
             "com.google.android.as",
@@ -295,7 +297,7 @@ class LiveCaptionReader : AccessibilityService() {
                 HindiTtsService.stopAndClear()
                 sentenceTimerJob?.cancel(); sentenceTimerJob = null
                 sentenceBuffer = ""; lastBufferEnqueued = ""; lastEnqueuedWordCount = 0
-                lastEnqueuedText = ""
+                lastEnqueuedText = ""; lastSubmitTotalWords = 0; lastSubmitMs = 0L; lastForcedMs = 0L
             }
             return null
         }
@@ -379,6 +381,8 @@ class LiveCaptionReader : AccessibilityService() {
     // Cooldown: track total LC word count and time at last submission
     private var lastSubmitTotalWords  = 0
     private var lastSubmitMs          = 0L
+    // Separate FORCE cooldown — tracks last time RULE 3 (FORCE) fired
+    private var lastForcedMs          = 0L
 
     private fun schedule(text: String) {
         // ── Language detection ────────────────────────────────────────────────
@@ -391,7 +395,7 @@ class LiveCaptionReader : AccessibilityService() {
                     lastEnqueued = ""; lastRawFull = ""; lastEnqueuedSents.clear()
                     sentenceBuffer = ""; lastBufferEnqueued = ""
                     lastEnqueuedWordCount = 0; lastEnqueuedText = ""
-                    lastSubmitTotalWords = 0; lastSubmitMs = 0L
+                    lastSubmitTotalWords = 0; lastSubmitMs = 0L; lastForcedMs = 0L
                     queue.clear(); expectedSeq = seqCounter.get() + 1
                 }
             } else { pendingLang = script; pendingCount = 1 }
@@ -483,14 +487,22 @@ class LiveCaptionReader : AccessibilityService() {
             return
         }
 
-        // ── RULE 3: FORCE — run-on with 6+ new words since last submit ────────
-        if (newWords >= MAX_WORDS_BEFORE_FORCE && wordsSinceSubmit >= 6) {
+        // ── RULE 3: FORCE — run-on sentence, no punctuation ──────────────────
+        // Only fires when BOTH conditions met:
+        //   a) 20+ new untranslated words (was 15 — too low for 60-word paragraphs)
+        //   b) 12+ new total words since last FORCE AND 5s since last FORCE
+        // This dual gate prevents the "same sentence submitted 10 times" cascade.
+        val timeSinceForce = System.currentTimeMillis() - lastForcedMs
+        if (newWords >= MAX_WORDS_BEFORE_FORCE &&
+            wordsSinceSubmit >= FORCE_MIN_NEW_WORDS &&
+            timeSinceForce  >= FORCE_COOLDOWN_MS) {
             sentenceTimerJob?.cancel(); pendingJob?.cancel()
             pendingJob = scope.launch {
                 delay(150)
                 val t = sentenceBuffer.trim()
                 if (t.isNotBlank() && t != lastEnqueuedText && wc(t) >= MIN_WORDS_SILENCE) {
                     CaptionLogger.log(TAG, "FORCE wc=${wc(t)} new=$wordsSinceSubmit")
+                    lastForcedMs = System.currentTimeMillis()
                     doSubmit(t, totalWords)
                 }
             }
