@@ -261,7 +261,7 @@ object HindiTtsService {
     }
 
     private suspend fun fetchLoop(workerName: String) {
-        while (isActive) {
+        while (currentCoroutineContext().isActive) {
             val item = fetchQueue.take()
             if (!enabled || !ttsReady) continue
 
