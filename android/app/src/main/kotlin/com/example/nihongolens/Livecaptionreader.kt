@@ -33,6 +33,11 @@ class LiveCaptionReader : AccessibilityService() {
         private const val DEBOUNCE_MS      = 400L
         private const val WATCHDOG_MS      = 2_000L
         private const val STARTUP_GRACE_MS = 1_000L
+        // Grace period before treating LC as gone.
+        // Covers: navigating to CL main screen, notification bar, app switcher.
+        // 3s: enough for user to dismiss and return to video.
+        // If LC stays gone > 3s → video genuinely ended/paused → confirm gone.
+        private const val LC_GONE_GRACE_MS  = 3_000L
         private const val LANG_CONFIRM     = 3
         private const val QUEUE_CAP        = 500  // never flush while running — FIFO backlog
         private const val STALE_MS         = Long.MAX_VALUE  // backlogs NEVER expire while running
@@ -183,6 +188,7 @@ class LiveCaptionReader : AccessibilityService() {
     private var lastSentText          = ""
     private var lastEnqueuedSents     = mutableSetOf<String>()
     private var lcVisible             = false
+    private var lcGoneMs              = 0L   // timestamp when LC first disappeared
     private var startupTime           = 0L
 
     // Stats
@@ -293,27 +299,39 @@ class LiveCaptionReader : AccessibilityService() {
 
         if (root == null) {
             if (lcVisible) {
-                lcVisible             = false
-                lastRawFull           = ""
-                lastEnqueued          = ""
-                lastSentText          = ""
+                val nowMs = System.currentTimeMillis()
+                if (lcGoneMs == 0L) {
+                    // First null read — start grace timer, don't reset yet
+                    lcGoneMs = nowMs
+                    CaptionLogger.log(TAG, "LC gone (grace period started)")
+                    return null
+                }
+                val goneForMs = nowMs - lcGoneMs
+                if (goneForMs < LC_GONE_GRACE_MS) {
+                    // Still within grace period — LC may reappear (app UI, notif bar etc.)
+                    // Keep translating and speaking whatever is in the queues
+                    return null
+                }
+                // Grace period expired — LC genuinely gone (video ended / paused)
+                lcVisible = false
+                lcGoneMs  = 0L
+                lastRawFull = ""; lastEnqueued = ""; lastSentText = ""
                 lastEnqueuedSents.clear()
-                val dropped = queue.size
-                queue.clear()
-                // FIFO: no expectedSeq reset — sentences queue in order
                 pendingJob?.cancel(); pendingJob = null
-                if (dropped > 0) CaptionLogger.log(TAG, "LC gone dropped=$dropped")
-                else              CaptionLogger.log(TAG, "LC gone")
-                OverlayService.clearQueue()
-                HindiTtsService.stopAndClear()
                 sentenceTimerJob?.cancel(); sentenceTimerJob = null
-                sentenceBuffer = ""; lastBufferEnqueued = ""; lastEnqueuedWordCount = 0
-                lastEnqueuedText = ""; lastSubmitTotalWords = 0; lastSubmitMs = 0L
-                // Keep lastForcedMs — prevents immediate FORCE when next speaker appears
-                // (FORCE_COOLDOWN_MS=5s still applies across LC gone/appear transitions)
+                sentenceBuffer = ""; lastBufferEnqueued = ""
+                lastEnqueuedWordCount = 0; lastEnqueuedText = ""
+                lastSubmitTotalWords = 0; lastSubmitMs = 0L
+                CaptionLogger.log(TAG, "LC gone (grace ${goneForMs}ms — confirmed)")
+                // NOTE: queue and TTS NOT cleared — FIFO backlog finishes playing
+                // Only explicit stop() / onDestroy clears queues
+            } else {
+                lcGoneMs = 0L  // already not visible, reset grace timer
             }
             return null
         }
+        // LC window found — cancel any pending gone timer
+        lcGoneMs = 0L
 
         val nodes = mutableListOf<String>()
         collectText(root, nodes)
@@ -814,7 +832,7 @@ class LiveCaptionReader : AccessibilityService() {
         lastEnqueued = ""; lastRawFull = ""; lastSentText = ""
         lastEnqueuedSents.clear()
         confirmedLang = ""; pendingLang = ""; pendingCount = 0
-        lcVisible = false; expectedSeq = 0L
+        lcVisible = false; lcGoneMs = 0L; expectedSeq = 0L
         lastHindiOut = ""; lastHindiTime = 0L
         translationCache.clear()
         SpeechCaptureService.latestHindi    = ""
