@@ -80,7 +80,7 @@ class OverlayService : Service() {
             }
         }
         fun clearQueue() {
-            CaptionLogger.log("Overlay", "clearQueue() called", CaptionLogger.Level.WARN)
+            CaptionLogger.log("Overlay", "clearQueue() called", CaptionLogger.LEVEL_WARN)
             instance?.handler?.post { instance?.onClear() }
         }
         fun setHoldMs(ms: Long) {
