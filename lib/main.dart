@@ -71,6 +71,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   final ScrollController _logScroll = ScrollController();
   Timer?  _logTimer;
   int     _logTab           = 0;   // 0=main, 1=log
+  String  _logFilter        = '';
+  String  _logCategory      = 'ALL';
+  String  _logStats         = '';
+  bool    _logAutoScroll    = true;
+  String  _downloadStatus   = '';
   String  _genderDetected   = 'male';
   String  _genderSelected   = 'auto';
   bool    _genderAnalyzerOn = false;
@@ -257,7 +262,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _logTimer = Timer.periodic(const Duration(seconds: 2), (_) async {
       if (!mounted) return;
       try {
-        final raw = await _ch.invokeMethod<String>('getLogs', 200);
+        final raw   = await _ch.invokeMethod<String>('getLogs', 2000);
+        final stats = await _ch.invokeMethod<String>('getLogStats') ?? '';
         if (raw == null || !mounted) return;
         final lines = raw.split('\n').where((l) => l.trim().isNotEmpty).toList();
         // Count skipped/translated from logs
@@ -281,6 +287,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             _genderStatus     = gst['status']?.toString()    ?? 'unknown';
           }
         });
+        if (mounted) setState(() => _logStats = stats);
         if (_logTab == 1 && _logScroll.hasClients) {
           _logScroll.animateTo(
             _logScroll.position.maxScrollExtent,
@@ -417,104 +424,206 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final femaleColor = Colors.pinkAccent;
     final maleColor   = Colors.lightBlueAccent;
     final gColor      = _genderDetected == 'female' ? femaleColor : maleColor;
+    final filtered    = _filteredLogs();
+    const cats        = ['ALL','LCReader','HindiTTS','Overlay','GenderAnalyzer','BGMusic','ERRORS'];
+    const catColors   = {
+      'LCReader': Color(0xFF4FC3F7), 'HindiTTS': Color(0xFF81C784),
+      'Overlay': Color(0xFFFFB74D), 'GenderAnalyzer': Color(0xFFCE93D8),
+      'BGMusic': Color(0xFF4DB6AC), 'ERRORS': Color(0xFFEF9A9A),
+    };
 
-    return Column(
-      children: [
-        // Status bar
+    return Column(children: [
+      // ── Status + action bar ──────────────────────────────────────────────
+      Container(
+        color: Colors.white.withValues(alpha: 0.05),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        child: Row(children: [
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+            decoration: BoxDecoration(
+              color: gColor.withValues(alpha: 0.15),
+              borderRadius: BorderRadius.circular(4),
+              border: Border.all(color: gColor.withValues(alpha: 0.5)),
+            ),
+            child: Row(mainAxisSize: MainAxisSize.min, children: [
+              Icon(Icons.mic, size: 12, color: gColor),
+              const SizedBox(width: 3),
+              Text('Voice: ${_genderDetected.toUpperCase()} (${_genderSelected == "auto" ? "AUTO" : _genderSelected.toUpperCase()})',
+                  style: TextStyle(color: gColor, fontSize: 10, fontWeight: FontWeight.bold)),
+              const SizedBox(width: 4),
+              Container(width: 6, height: 6,
+                  decoration: BoxDecoration(shape: BoxShape.circle,
+                      color: _genderAnalyzerOn ? Colors.greenAccent : Colors.redAccent)),
+            ]),
+          ),
+          const SizedBox(width: 6),
+          Text('T:$_translatedCount S:$_skippedCount',
+              style: const TextStyle(color: Colors.white38, fontSize: 10)),
+          const Spacer(),
+          // Auto-scroll toggle
+          GestureDetector(
+            onTap: () => setState(() => _logAutoScroll = !_logAutoScroll),
+            child: Icon(_logAutoScroll ? Icons.vertical_align_bottom : Icons.pause,
+                color: _logAutoScroll ? Colors.greenAccent : Colors.white38, size: 18),
+          ),
+          const SizedBox(width: 8),
+          // Download button
+          GestureDetector(
+            onTap: _downloadLogs,
+            child: const Icon(Icons.download, color: Colors.lightBlueAccent, size: 18),
+          ),
+          const SizedBox(width: 8),
+          // Reset button
+          GestureDetector(
+            onTap: _resetLogs,
+            child: const Icon(Icons.delete_sweep, color: Colors.redAccent, size: 18),
+          ),
+        ]),
+      ),
+
+      // ── Stats bar ────────────────────────────────────────────────────────
+      if (_logStats.isNotEmpty)
         Container(
-          color: Colors.white.withValues(alpha: 0.05),
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          child: Row(children: [
-            // Gender status
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-              decoration: BoxDecoration(
-                color: gColor.withValues(alpha: 0.15),
-                borderRadius: BorderRadius.circular(4),
-                border: Border.all(color: gColor.withValues(alpha: 0.5)),
-              ),
-              child: Row(mainAxisSize: MainAxisSize.min, children: [
-                Icon(Icons.mic, size: 13, color: gColor),
-                const SizedBox(width: 4),
-                Text(
-                  'Voice: ${_genderDetected.toUpperCase()}  (${_genderSelected == "auto" ? "AUTO" : _genderSelected.toUpperCase()})',
-                  style: TextStyle(color: gColor, fontSize: 11, fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(width: 6),
-                Container(
-                  width: 7, height: 7,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: _genderAnalyzerOn ? Colors.greenAccent : Colors.redAccent,
-                  ),
-                ),
-              ]),
-            ),
-            const SizedBox(width: 8),
-            // GenderAnalyzer status
-            Expanded(
-              child: Text(
-                _genderStatus,
-                style: TextStyle(
-                  color: _genderAnalyzerOn ? Colors.greenAccent.withValues(alpha: 0.7) : Colors.redAccent.withValues(alpha: 0.7),
-                  fontSize: 10,
-                ),
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
-            Text(
-              'T:$_translatedCount S:$_skippedCount',
-              style: const TextStyle(color: Colors.white38, fontSize: 11),
-            ),
-            const Spacer(),
-            // Clear button
-            GestureDetector(
-              onTap: () async {
-                await _ch.invokeMethod('clearLogs');
-                if (mounted) setState(() { _logLines.clear(); _skippedCount = 0; _translatedCount = 0; });
-              },
-              child: const Icon(Icons.delete_outline, color: Colors.white38, size: 18),
-            ),
-          ]),
+          width: double.infinity,
+          color: const Color(0xFF1E1E3F),
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+          child: Text(_logStats,
+              style: const TextStyle(color: Colors.white54, fontSize: 9, fontFamily: 'monospace'),
+              maxLines: 2, overflow: TextOverflow.ellipsis),
         ),
-        // Log lines
-        Expanded(
-          child: _logLines.isEmpty
-              ? const Center(child: Text('No logs yet — start Caption Lens',
-                  style: TextStyle(color: Colors.white24)))
-              : ListView.builder(
-                  controller: _logScroll,
-                  padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
-                  itemCount: _logLines.length,
-                  itemBuilder: (_, i) {
-                    final line = _logLines[i];
-                    Color c = Colors.white54;
-                    if (line.contains('Gender') || line.contains('YIN')) {
-                      c = _genderDetected == 'female' ? femaleColor : maleColor;
-                    } else if (line.contains('SKIP')) {
-                      c = Colors.orange.withValues(alpha: 0.7);
-                    } else if (line.contains('ENQ') || line.contains('OK ')) {
-                      c = Colors.greenAccent.withValues(alpha: 0.8);
-                    } else if (line.contains('ERR') || line.contains('error')) {
-                      c = Colors.redAccent.withValues(alpha: 0.8);
-                    } else if (line.contains('female') || line.contains('FEMALE')) {
-                      c = femaleColor.withValues(alpha: 0.9);
-                    } else if (line.contains('male') || line.contains('MALE')) {
-                      c = maleColor.withValues(alpha: 0.7);
-                    }
-                    return Text(
-                      line,
-                      style: TextStyle(
-                        color: c, fontSize: 10,
-                        fontFamily: 'monospace',
-                        height: 1.4,
-                      ),
-                    );
-                  },
-                ),
+
+      // ── Download status ──────────────────────────────────────────────────
+      if (_downloadStatus.isNotEmpty)
+        Container(
+          width: double.infinity,
+          color: _downloadStatus.startsWith('✅') ? const Color(0xFF1B3A1B) : const Color(0xFF3A1B1B),
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+          child: Text(_downloadStatus,
+              style: const TextStyle(color: Colors.white70, fontSize: 10, fontFamily: 'monospace')),
         ),
-      ],
-    );
+
+      // ── Search bar ───────────────────────────────────────────────────────
+      Padding(
+        padding: const EdgeInsets.fromLTRB(8, 6, 8, 0),
+        child: SizedBox(
+          height: 32,
+          child: TextField(
+            style: const TextStyle(color: Colors.white, fontSize: 11),
+            decoration: InputDecoration(
+              hintText: 'Search logs...',
+              hintStyle: const TextStyle(color: Colors.white30, fontSize: 11),
+              prefixIcon: const Icon(Icons.search, color: Colors.white30, size: 16),
+              filled: true, fillColor: const Color(0xFF1E1E3F),
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide.none),
+              contentPadding: const EdgeInsets.symmetric(vertical: 0, horizontal: 8),
+            ),
+            onChanged: (v) => setState(() => _logFilter = v),
+          ),
+        ),
+      ),
+
+      // ── Category filter chips ────────────────────────────────────────────
+      SizedBox(
+        height: 30,
+        child: ListView.separated(
+          scrollDirection: Axis.horizontal,
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+          itemCount: cats.length,
+          separatorBuilder: (_, __) => const SizedBox(width: 4),
+          itemBuilder: (_, i) {
+            final cat    = cats[i];
+            final active = _logCategory == cat;
+            final col    = catColors[cat] ?? Colors.white54;
+            return GestureDetector(
+              onTap: () => setState(() => _logCategory = cat),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                decoration: BoxDecoration(
+                  color: active ? col.withValues(alpha: 0.2) : const Color(0xFF1E1E3F),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: active ? col : Colors.white24, width: 0.8),
+                ),
+                child: Text(cat, style: TextStyle(color: active ? col : Colors.white38,
+                    fontSize: 10, fontWeight: active ? FontWeight.bold : FontWeight.normal)),
+              ),
+            );
+          },
+        ),
+      ),
+
+      // ── Line count ───────────────────────────────────────────────────────
+      Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 1),
+        child: Align(alignment: Alignment.centerLeft,
+            child: Text('${filtered.length} / ${_logLines.length} lines',
+                style: const TextStyle(color: Colors.white24, fontSize: 9))),
+      ),
+
+      // ── Log lines ────────────────────────────────────────────────────────
+      Expanded(
+        child: filtered.isEmpty
+            ? const Center(child: Text('No logs', style: TextStyle(color: Colors.white24)))
+            : ListView.builder(
+                controller: _logAutoScroll ? _logScroll : null,
+                padding: const EdgeInsets.fromLTRB(8, 2, 8, 8),
+                itemCount: filtered.length,
+                itemBuilder: (_, i) {
+                  final line = filtered[i];
+                  Color c = Colors.white54;
+                  if (line.contains('[E]') || line.contains('SUBTITLE-GONE'))   c = Colors.redAccent.withValues(alpha: 0.9);
+                  else if (line.contains('[W]') || line.contains('WARN'))       c = Colors.amber.withValues(alpha: 0.9);
+                  else if (line.contains('[Overlay]'))    c = const Color(0xFFFFB74D);
+                  else if (line.contains('[HindiTTS]'))   c = const Color(0xFF81C784);
+                  else if (line.contains('[LCReader]'))   c = const Color(0xFF4FC3F7);
+                  else if (line.contains('GenderAnalyzer')) c = const Color(0xFFCE93D8);
+                  else if (line.contains('BGMusic'))      c = const Color(0xFF4DB6AC);
+                  else if (line.contains('female') || line.contains('FEMALE')) c = femaleColor.withValues(alpha: 0.9);
+                  else if (line.contains('male') || line.contains('MALE'))     c = maleColor.withValues(alpha: 0.7);
+                  else if (line.contains('ENQ') || line.contains('OK['))       c = Colors.greenAccent.withValues(alpha: 0.8);
+                  else if (line.contains('ERR') || line.contains('error'))     c = Colors.redAccent.withValues(alpha: 0.8);
+
+                  return Container(
+                    color: (line.contains('SUBTITLE-GONE') || line.contains('[E]'))
+                        ? Colors.red.withValues(alpha: 0.08) : Colors.transparent,
+                    child: Text(line, style: TextStyle(color: c, fontSize: 10,
+                        fontFamily: 'monospace', height: 1.35)),
+                  );
+                }),
+      ),
+    ]);
+  }
+
+
+
+  Future<void> _downloadLogs() async {
+    try {
+      final path = await _ch.invokeMethod<String>('downloadLogs') ?? '';
+      if (mounted) setState(() => _downloadStatus = path.isNotEmpty ? '✅ Saved: ${path.split('/').last}' : '❌ failed');
+      Future.delayed(const Duration(seconds: 5), () {
+        if (mounted) setState(() => _downloadStatus = '');
+      });
+    } catch (e) {
+      if (mounted) setState(() => _downloadStatus = '❌ $e');
+    }
+  }
+
+  Future<void> _resetLogs() async {
+    await _ch.invokeMethod('clearLogs');
+    if (mounted) setState(() {
+      _logLines.clear(); _logStats = ''; _downloadStatus = '';
+      _skippedCount = 0; _translatedCount = 0;
+    });
+  }
+
+  List<String> _filteredLogs() {
+    return _logLines.where((l) {
+      final catMatch = _logCategory == 'ALL'
+          || (_logCategory == 'ERRORS' && (l.contains('ERR') || l.contains('SUBTITLE-GONE') || l.contains('[E]')))
+          || l.contains('[' + _logCategory + ']')
+          || l.contains(_logCategory);
+      final textMatch = _logFilter.isEmpty || l.toLowerCase().contains(_logFilter.toLowerCase());
+      return catMatch && textMatch;
+    }).toList();
   }
 
   Widget _buildHeader() => Row(children: [
