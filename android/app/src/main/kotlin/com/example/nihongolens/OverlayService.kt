@@ -54,11 +54,12 @@ class OverlayService : Service() {
 
         fun updateText(original: String, hindi: String) {
             latestOriginal = original; latestHindi = hindi
-            // FIFO TOKEN MODE: Subtitle display is now driven by HindiTtsService play worker.
-            // updateText() only stores the latest values for polling (Flutter UI, SpeechCaptureService).
-            // Livecaptionreader no longer calls this to show subtitles — it calls HindiTtsService.speak()
-            // which queues for synthesis, and the play worker calls showTtsText() right before audio plays.
-            // DO NOT call onNewHindi() here — that would show subtitle before/without audio.
+            // DECOUPLED MODE: Show subtitle immediately when translation arrives.
+            // No longer waiting for TTS audio — subtitle speed = CT2 speed (~0.8s).
+            // Audio plays 0.2s later (TTS synthesis) — natural read-then-hear experience.
+            if (hindi.isNotBlank()) {
+                instance?.handler?.post { instance?.onNewHindi(hindi) }
+            }
         }
 
         // Called by TTS play worker when it STARTS speaking a sentence.
