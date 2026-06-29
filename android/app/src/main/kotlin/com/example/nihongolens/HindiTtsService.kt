@@ -473,13 +473,10 @@ object HindiTtsService {
                 try {
                     isSpeaking = true
                     CaptionLogger.log(TAG, "PLAY ${item.durMs}ms '${item.text.take(40)}'")
-                    withContext(Dispatchers.Main) {
-                        OverlayService.showTtsText(item.text)
-                    }
+                    // Subtitle is now shown by deliverHindi() immediately when translation arrives.
+                    // Play worker only handles audio — no longer controls overlay display.
+                    // This decouples subtitle speed (CT2 ~0.8s) from audio speed (TTS ~1s).
                     playWavFile(item.wavFile)
-                    withContext(Dispatchers.Main) {
-                        OverlayService.clearTtsText()
-                    }
                     speakingUntilMs = System.currentTimeMillis() + 200L
                 } catch (e: Exception) {
                     CaptionLogger.log(TAG, "PLAY-ERR ${e.message}")
