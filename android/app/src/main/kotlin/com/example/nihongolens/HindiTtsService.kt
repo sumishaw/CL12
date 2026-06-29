@@ -240,8 +240,12 @@ object HindiTtsService {
         // putIfAbsent found existing token → skipped → gender never applied.
         // Now token includes gender so re-play occurs on switch.
         val genderBit = if (isFemale) 0x80000000.toInt() else 0
-        val token = n.hashCode() xor genderBit
-        if (spokenTokens.putIfAbsent(token, true) != null) return
+        // FIX: numbers/short texts use seq-based token to prevent dedup silencing them
+        // "20 pounds" repeated across sentences must speak each time
+        val isNumericHeavy = n.count { it.isDigit() } > n.length / 3
+        val token = if (isNumericHeavy) System.currentTimeMillis().toInt()
+                    else n.hashCode() xor genderBit
+        if (!isNumericHeavy && spokenTokens.putIfAbsent(token, true) != null) return
         if (spokenTokens.size > 300) spokenTokens.clear()
         val genderTag = if (isFemale) "female" else "male"
 
@@ -280,15 +284,11 @@ object HindiTtsService {
             val item = fetchQueue.take()
             if (!enabled || !ttsReady) continue
 
+            // FIFO: no stale/overload drops — every sentence IS spoken
+            // Backlog plays in order; clears only when Caption Lens is stopped
             val ageMs = System.currentTimeMillis() - item.enqMs
-            if (ageMs > 10_000L) {
-                CaptionLogger.log(TAG, "TTS-SKIP stale ${ageMs/1000}s '${item.text.take(30)}'")
-                continue
-            }
-            if (fetchQueue.size > 2) {
-                CaptionLogger.log(TAG, "TTS-SKIP overloaded q=${fetchQueue.size+1}")
-                continue
-            }
+            if (ageMs > 30_000L)
+                CaptionLogger.log(TAG, "TTS-BACKLOG ${ageMs/1000}s '${item.text.take(30)}'")
 
             val t0 = System.currentTimeMillis()
             val textToSpeak = if (item.gender == "female") toFeminineHindi(item.text) else item.text
@@ -593,6 +593,9 @@ object HindiTtsService {
     }
 
     fun toFeminineHindi(text: String): String {
+        // FIX: if text is mainly numbers/digits, return unchanged
+        // "20 pounds", "100%", "247" must not have verb replacements applied
+        if (text.count { it.isDigit() } > text.length / 3) return text
         var t = text
 
         // ── Pronouns ─────────────────────────────────────────────────────────
