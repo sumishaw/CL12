@@ -730,28 +730,24 @@ class LiveCaptionReader : AccessibilityService() {
         SpeechCaptureService.latestHindi   = hindi
         SpeechCaptureService.latestEnglish = text
 
-        // FIFO TOKEN FIX:
-        // Previously: OverlayService.updateText() was called immediately when translation
-        // arrived → subtitle refreshed every 1-2s regardless of TTS state → subtitles
-        // flashed too fast, TTS was always playing an old sentence.
-        //
-        // Now: subtitle display is driven EXCLUSIVELY by HindiTtsService play worker.
-        // Flow: speak() → fetchQueue → synthesize → playQueue → PLAY → showTtsText()
-        // The subtitle only appears when TTS is about to speak it (right before playWav).
-        // When TTS finishes, clearTtsText() is called → subtitle hidden briefly.
-        // Next sentence in playQueue → showTtsText() → subtitle updates.
-        //
-        // This creates perfect audio+subtitle sync with FIFO ordering.
-        // The only direct overlay call is clearing on LC gone (line ~210).
+        // DECOUPLED SUBTITLE + AUDIO — the correct sync architecture:
+        // SUBTITLE: shown IMMEDIATELY when CT2 translation arrives (~0.8s after sentence).
+        //   No waiting for TTS. User sees Hindi text right away. Zero gap.
+        // AUDIO: queued independently, synthesized in ~0.2s, plays after subtitle appears.
+        //   Natural feel: read subtitle first, hear audio 0.2s later.
+        // Previously: subtitle waited for audio → 1s blank screen pause every sentence.
+        // Now: subtitle at t=0ms, audio at t=200ms → always in sync, no blank gaps.
 
-        // Send to Flutter UI counter (does NOT touch overlay)
         scope.launch(Dispatchers.Main) {
+            OverlayService.updateText(text, hindi)
+            OverlayService.showTtsText(hindi)
             MainActivity.instance?.onTranslation(text, hindi, hindi)
         }
 
-        // Queue for TTS — play worker controls overlay display
+        // Audio plays independently — does NOT control subtitle anymore
         HindiTtsService.speak(hindi, text)
     }
+
 
     private fun callServer(text: String): Pair<String, String>? {
         if (text.trim().length < 4) return null
