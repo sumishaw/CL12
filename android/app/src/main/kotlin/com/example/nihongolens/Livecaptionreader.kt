@@ -34,7 +34,7 @@ class LiveCaptionReader : AccessibilityService() {
         private const val STARTUP_GRACE_MS = 1_000L
         private const val LANG_CONFIRM     = 3
         private const val QUEUE_CAP        = 3
-        private const val STALE_MS         = 5_000L   // drop sentences speaker said >5s ago
+        private const val STALE_MS         = 6_000L   // 12-word chunk: 1.2s translate + 4.8s margin
 
         // ── SENTENCE COMPLETION SILENCE GAP ──────────────────────────────────
         // How long LC must be SILENT (no new text) before we treat current buffer as complete sentence.
@@ -114,21 +114,26 @@ class LiveCaptionReader : AccessibilityService() {
 
         // ── MINIMUM WORDS FOR TRANSLATION ────────────────────────────────────
         private const val MIN_WORDS_HARD    = 2   // after hard punctuation (lowered: "Do you?" = 2 words, must translate)
-        private const val MIN_WORDS_SOFT    = 6   // after soft punctuation
-        private const val MIN_WORDS_SILENCE = 5   // after silence gap
+        private const val MIN_WORDS_SOFT    = 7   // after soft punctuation
+        private const val MIN_WORDS_SILENCE = 7   // avoid tiny fragments < 7 words
 
         // ── FORCE / COOLDOWN THRESHOLDS ───────────────────────────────────────
         // MAX_WORDS_BEFORE_FORCE: raised 15→20. At 15, a 60-word paragraph triggered
         // FORCE every 6 words = 10 submissions of the same sentence → CT2 flood.
-        private const val MAX_WORDS_BEFORE_FORCE = 20
+        // Match server chunk size: 12 words per CT2 call → ~1.2s per chunk
+        // Previously 20 words → 2.5s per chunk → 5-chunk paragraph = 12.5s backlog
+        private const val MAX_WORDS_BEFORE_FORCE = 12
 
         // FORCE_MIN_NEW_WORDS: raised 6→12. Previously wordsSinceSubmit=7 bypassed
         // cooldown, causing same text to be submitted every 7 words (3s = 1+ per second).
-        private const val FORCE_MIN_NEW_WORDS = 12
+        // After FORCE, need 6 new words before next FORCE (was 12)
+        // With 12-word chunks: 6 new words = speaker said half a chunk = safe to re-submit
+        private const val FORCE_MIN_NEW_WORDS = 6
 
         // FORCE_COOLDOWN_MS: hard time-based lock after any FORCE submission.
         // Even if 12 new words arrive in 1 second, don't force-submit again.
-        private const val FORCE_COOLDOWN_MS  = 5_000L
+        // 3s cooldown: 12-word chunk takes ~1.2s to translate → 3s gives 2.5× margin
+        private const val FORCE_COOLDOWN_MS  = 3_000L
 
         private val LC_PACKAGES = setOf(
             "com.google.android.as",
