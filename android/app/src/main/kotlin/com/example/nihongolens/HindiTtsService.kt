@@ -632,7 +632,7 @@ object HindiTtsService {
         Emotion.FEARFUL    -> Pair(1.30f, 1.25f)   // high, fast, tense
         Emotion.SURPRISED  -> Pair(1.40f, 1.15f)   // very high pitch spike
         Emotion.SIGHING    -> Pair(0.80f, 0.72f)   // low, very slow, breathy
-        Emotion.SINGING    -> Pair(1.10f, 0.75f)   // melodic, slow
+        Emotion.SINGING    -> Pair(1.20f, 0.65f)   // less flat than speech, still no melody tracking
         Emotion.GASPING    -> Pair(1.35f, 1.40f)   // high, very fast
         Emotion.PANTING    -> Pair(1.20f, 1.38f)   // high, rapid
         Emotion.MOANING    -> Pair(0.72f, 0.65f)   // very low, very slow
