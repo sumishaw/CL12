@@ -92,6 +92,50 @@ object HindiTtsService {
     // frame-to-frame) — same cadence as currentVoiceType, just continuous.
     @Volatile var currentMeasuredF0: Float = 0f   // 0 = no measurement yet
 
+    // ── Speaker baseline F0 (locked per speaker session) ─────────────────────
+    // After enough voiced speech frames accumulate, we LOCK the speaker's
+    // baseline F0. This prevents the pitch from drifting sentence-to-sentence
+    // as the rolling average shifts. The lock holds until the gender detector
+    // confirms a genuine speaker change (MIN_SWITCH_INTERVAL = 12s).
+    // Result: same speaker's Hindi TTS pitch stays CONSISTENT across all
+    // their sentences — doesn't randomly become another person mid-conversation.
+    @Volatile var lockedSpeakerF0: Float = 0f   // 0 = not yet locked
+    @Volatile var lockedSpeakerGender: Gender = Gender.AUTO
+    private const val LOCK_MIN_FRAMES = 20      // need 20+ voiced frames to lock
+    @Volatile var lockedFrameCount: Int = 0
+
+    fun tryLockSpeakerF0(measuredF0: Float, gender: Gender) {
+        if (lockedSpeakerF0 > 0f && gender == lockedSpeakerGender) return  // already locked
+        lockedFrameCount++
+        if (lockedFrameCount >= LOCK_MIN_FRAMES && measuredF0 > 0f) {
+            lockedSpeakerF0   = measuredF0
+            lockedSpeakerGender = gender
+            CaptionLogger.log("HindiTTS",
+                "SPEAKER-F0-LOCKED: ${gender} baseline=${measuredF0.toInt()}Hz " +
+                "ratio=${String.format("%.2f", exactPitchRatio(measuredF0, gender == Gender.FEMALE))}")
+        }
+    }
+
+    fun resetSpeakerLock() {
+        lockedSpeakerF0     = 0f
+        lockedSpeakerGender = Gender.AUTO
+        lockedFrameCount    = 0
+        CaptionLogger.log("HindiTTS", "SPEAKER-LOCK-RESET (new speaker detected)")
+    }
+
+    // Returns the STABLE pitch ratio for TTS — uses locked baseline when available,
+    // falls back to rolling average, then to gender default
+    fun stablePitchRatio(isFemale: Boolean): Float {
+        val gender = if (isFemale) Gender.FEMALE else Gender.MALE
+        return when {
+            lockedSpeakerF0 > 0f && lockedSpeakerGender == gender ->
+                exactPitchRatio(lockedSpeakerF0, isFemale)  // LOCKED: consistent across sentences
+            currentMeasuredF0 > 0f ->
+                exactPitchRatio(currentMeasuredF0, isFemale) // not yet locked: use rolling average
+            else -> 1.0f  // no data: neutral
+        }
+    }
+
     // ── Captured F0 contour for SSML prosody ─────────────────────────────────
     // Written by GenderAnalyzer.flushContour() just before each sentence is
     // enqueued. speak() reads these to build SSML that mirrors the original
@@ -193,6 +237,9 @@ object HindiTtsService {
 
     // Debug accessors for CaptionLogger state snapshot
     fun fetchQueueSize() = fetchQueue.size
+
+    // Called by GenderAnalyzer when a confirmed gender switch occurs (new speaker)
+    fun onSpeakerChanged() = resetSpeakerLock()
     fun playQueueSize()  = playQueue.size
 
     // ── Init ──────────────────────────────────────────────────────────────────
@@ -339,17 +386,17 @@ object HindiTtsService {
         // pitch ratio. If no measurement yet (currentMeasuredF0=0), fall back
         // to the old gender-only approximation so voices aren't silent/flat
         // before GenderAnalyzer has gathered enough samples.
-        val hasMeasurement = currentMeasuredF0 > 0f
         val hasSpecificVoice = if (isFemale) voiceFemale != null else voiceMale != null
 
-        val basePitch: Float
-        if (hasMeasurement) {
-            // Exact ratio: this speaker's Hz ÷ TTS voice's natural Hz.
-            // 242Hz female → ratio=1.21 (not snapped to a fixed Soprano constant)
-            basePitch = exactPitchRatio(currentMeasuredF0, isFemale)
-        } else {
-            basePitch = if (hasSpecificVoice) 1.0f
-                       else if (isFemale) 1.15f else 0.88f
+        // Use STABLE (locked) pitch ratio — same speaker always gets the same
+        // base pitch across all sentences. Prevents same person sounding like
+        // a different person between sentences due to F0 rolling average drift.
+        val basePitch: Float = when {
+            lockedSpeakerF0 > 0f -> stablePitchRatio(isFemale)  // locked: fully consistent
+            currentMeasuredF0 > 0f -> exactPitchRatio(currentMeasuredF0, isFemale)  // accumulating
+            hasSpecificVoice -> 1.0f       // no data, voice handles gender
+            isFemale -> 1.15f              // no data, no specific voice: approximate
+            else -> 0.88f
         }
 
         val finalPitch = (basePitch * pitchMult).coerceIn(0.5f, 2.0f)
