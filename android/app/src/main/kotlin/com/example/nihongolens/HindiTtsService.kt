@@ -155,80 +155,37 @@ object HindiTtsService {
         voiceProfile = profile
         val isFemale = detectedGender == Gender.FEMALE
 
-        // ── Category 1: F0 → pitch ratio (exact measured Hz) ─────────────────
-        // Use measured meanF0 directly — overrides EMA when profile is fresh
-        // Feed VoiceProfile meanF0 into sentence buffer (VoiceAnalyzer profile
-        // averages over ~2s which is roughly one sentence — feeds the buffer)
-        if (profile.meanF0 > 60f) {
+        // Feed meanF0 into sentence buffer
+        if (profile.meanF0 > 60f)
             addF0Frame(profile.meanF0, if (isFemale) Gender.FEMALE else Gender.MALE)
-        }
 
-        // ── Category 2: Spectral centroid → pitch brightness trim ────────────
-        // High centroid (bright/young voice) → small pitch up
-        // Low centroid (dark/bass voice) → small pitch down
-        // Reference: female ~2500Hz, male ~1800Hz, deep bass ~1200Hz
+        // Category 2: Centroid → subtle pitch brightness trim (±8% max)
         val centroidRef = if (isFemale) 2500f else 1800f
-        val centroidTrim = ((profile.spectralCentroid - centroidRef) / centroidRef * 0.12f)
-            .coerceIn(-0.15f, 0.15f)
-        centroidPitchTrim = centroidTrim
+        centroidPitchTrim = ((profile.spectralCentroid - centroidRef) / centroidRef * 0.06f)
+            .coerceIn(-0.08f, 0.08f)
 
-        // ── Category 2: Spectral flux → TTS rate adjustment ──────────────────
-        // High flux = crisp fast articulation → faster TTS rate
-        // Normalized against expected flux range
-        val fluxRate = when {
-            profile.spectralFlux > 8000f -> 0.15f   // very crisp → +15% rate
-            profile.spectralFlux > 4000f -> 0.08f   // crisp
-            profile.spectralFlux < 1000f -> -0.10f  // slow articulation → -10%
-            else -> 0f
-        }
-        spectralFluxRateAdj = fluxRate
+        // Category 4: Syllable rate → direct rate ratio (4.5/s = 1.0 reference)
+        syllableRateMultiplier = if (profile.syllableRate > 1f)
+            (profile.syllableRate / 4.5f).coerceIn(0.6f, 1.8f) else 1.0f
 
-        // ── Category 3: Voice quality → emotion/style selection ──────────────
-        // Jitter + shimmer + HNR together determine voice texture tag
-        val textureEmotion: HindiTtsService.Emotion? = when {
-            profile.jitter > 1.5f && profile.shimmer > 8f ->
-                HindiTtsService.Emotion.GRAVELLY    // raspy/elderly
-            profile.shimmer > 7f && profile.hnr < 14f ->
-                HindiTtsService.Emotion.BREATHY     // breathy/airy
-            profile.hnr < 13f && profile.jitter < 1f ->
-                HindiTtsService.Emotion.WHISPERY    // whispery/soft
-            profile.jitter < 0.4f && profile.hnr > 22f ->
-                null   // very clean voice — no texture override
-            else -> null
+        // Category 3: Voice quality → texture emotion
+        voiceTextureEmotion = when {
+            profile.jitter > 1.5f && profile.shimmer > 8f -> Emotion.GRAVELLY
+            profile.shimmer > 7f && profile.hnr < 14f     -> Emotion.BREATHY
+            profile.hnr < 13f && profile.jitter < 1f      -> Emotion.WHISPERY
+            else                                           -> null
         }
-        // Only apply texture emotion if it's different from current detected emotion
-        if (textureEmotion != null && currentEmotion == HindiTtsService.Emotion.NEUTRAL) {
-            voiceTextureEmotion = textureEmotion
-        } else {
-            voiceTextureEmotion = null
-        }
-
-        // ── Category 4: Syllable rate → TTS base rate ────────────────────────
-        // Measured syllable rate maps directly to TTS speech rate
-        // Reference: natural Hindi speech ~4-5 syllables/sec
-        // Fast speaker (>6/s) → TTS rate up; slow speaker (<3/s) → rate down
-        val syllableRateAdj = when {
-            profile.syllableRate > 6.5f -> 0.20f   // very fast talker
-            profile.syllableRate > 5.5f -> 0.12f   // fast
-            profile.syllableRate < 2.5f -> -0.18f  // very slow
-            profile.syllableRate < 3.5f -> -0.08f  // slow
-            else -> 0f                              // normal pace
-        }
-        syllableRateAdjustment = syllableRateAdj
 
         CaptionLogger.log("HindiTTS",
-            "PROFILE-APPLIED: sentF0=${sentenceF0.toInt()}Hz meanF0=${profile.meanF0.toInt()}Hz " +
-            "centrimTrim=${"%.2f".format(centroidTrim)} " +
-            "fluxAdj=${"%.2f".format(fluxRate)} " +
-            "syllAdj=${"%.2f".format(syllableRateAdj)} " +
-            "texture=$textureEmotion")
+            "PROFILE: sentF0=${sentenceF0.toInt()}Hz " +
+            "syllRate=${"%.1f".format(profile.syllableRate)}/s→×${"%.2f".format(syllableRateMultiplier)} " +
+            "centTrim=${(centroidPitchTrim*100).toInt()}% texture=$voiceTextureEmotion")
     }
 
-    // Profile-derived adjustments applied in speak()
-    @Volatile var centroidPitchTrim:    Float = 0f
-    @Volatile var spectralFluxRateAdj:  Float = 0f
-    @Volatile var syllableRateAdjustment: Float = 0f
-    @Volatile var voiceTextureEmotion: HindiTtsService.Emotion? = null
+    @Volatile var centroidPitchTrim:      Float = 0f
+    @Volatile var syllableRateMultiplier: Float = 1.0f
+    @Volatile var voiceTextureEmotion:    Emotion? = null
+
 
     fun stablePitchRatio(isFemale: Boolean): Float = when {
         sentenceF0 > 0f -> exactPitchRatio(sentenceF0, isFemale)
@@ -512,10 +469,13 @@ object HindiTtsService {
 
         // Apply VoiceProfile-derived adjustments on top of base pitch/rate
         // centroidPitchTrim: spectral brightness offset (high centroid = brighter pitch)
-        // syllableRateAdjustment: measured speaking speed → TTS rate
-        // spectralFluxRateAdj: articulation crispness → rate
-        val profilePitch = basePitch + centroidPitchTrim
-        val profileRate  = ttsSpeedMultiplier + syllableRateAdjustment + spectralFluxRateAdj
+        // syllableRateMultiplier: measured speaking speed → TTS rate
+        // 0f: articulation crispness → rate
+        // Direct metric mapping — no SSML, no EMA:
+        // pitch = measured F0 / TTS natural F0 + centroid brightness trim
+        // rate  = measured syllable rate / reference rate (4.5/s)
+        val profilePitch = (basePitch + centroidPitchTrim).coerceIn(0.75f, 1.45f)
+        val profileRate  = (ttsSpeedMultiplier * syllableRateMultiplier).coerceIn(0.5f, 2.0f)
 
         // Use voiceTextureEmotion if active and no other emotion detected
         val effectiveEmotion = if (voiceTextureEmotion != null && currentEmotion == Emotion.NEUTRAL)
@@ -924,21 +884,12 @@ object HindiTtsService {
                     putInt(android.speech.tts.TextToSpeech.Engine.KEY_PARAM_STREAM, 3)
                 }
                 CaptionLogger.log(TAG, "SSML-EXPRESSIVE: ${item.emotion}")
-            } else if (capturedRmsCurve.any { it > 0f }) {
-                // Have RMS curve data: use SSML with per-word RATE variation
-                // Rate changes sound natural on Android TTS (duration prosody)
-                // Pitch stays fixed at sentence level via setPitch() above
-                inputText = buildSsml(safeText, item.pitch,
-                    capturedStartF0, capturedPeakF0, capturedEndF0, naturalF0)
-                inputBundle = android.os.Bundle().apply {
-                    putInt(android.speech.tts.TextToSpeech.Engine.KEY_PARAM_STREAM, 3)
-                }
-                CaptionLogger.log(TAG, "RATE-SSML pitch=${String.format("%.2f", item.pitch)}")
             } else {
-                // No curve data: plain text (setPitch/setSpeechRate handle everything)
+                // Plain text — setPitch/setSpeechRate applied above are sufficient.
+                // No SSML: per-word SSML tags cause robotic pitch jumps on Android TTS.
                 inputText   = safeText
                 inputBundle = null
-                CaptionLogger.log(TAG, "PLAIN-TTS pitch=${String.format("%.2f", item.pitch)}")
+                CaptionLogger.log(TAG, "TTS pitch=${String.format("%.2f", item.pitch)} rate=${String.format("%.2f", item.rate)}")
             }
 
             // Bridge Android TTS callback to coroutine
