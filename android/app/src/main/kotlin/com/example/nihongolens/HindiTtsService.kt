@@ -104,39 +104,48 @@ object HindiTtsService {
     //   frames to shift, which only happens with a genuine speaker change.
     //
     // This is THE number used for the TTS base pitch — not currentMeasuredF0.
-    @Volatile var emaF0: Float = 0f           // EMA-smoothed F0 for TTS pitch
-    @Volatile var emaGender: Gender = Gender.AUTO  // which gender the EMA tracks
-    private const val EMA_ALPHA      = 0.08f  // low = very stable (changes slowly)
-    private const val EMA_ALPHA_INIT = 0.35f  // higher for first few frames (faster convergence)
-    @Volatile var emaFrameCount: Int = 0      // frames accumulated so far
+    // ── Per-Sentence Locked Median F0 (replaces EMA) ───────────────────────
+    // EMA caused within-sentence voice drift — basePitch shifted every 10ms frame.
+    // Median locks ONE F0 value per sentence using all voiced frames in the window.
+    // Every word in a sentence gets the SAME base pitch. Natural intonation variation
+    // comes from the per-word SSML contour, not from a drifting base.
 
-    fun updateEmaF0(rawF0: Float, gender: Gender) {
-        if (rawF0 <= 0f) return
-        if (emaGender != gender) {
-            // Speaker changed gender — reset EMA to converge quickly to new speaker
-            emaF0        = rawF0                // seed with current measurement
-            emaGender    = gender
-            emaFrameCount = 1
-            CaptionLogger.log("HindiTTS",
-                "EMA-RESET (gender switch) seed=${rawF0.toInt()}Hz")
-            return
-        }
-        val alpha = if (emaFrameCount < 15) EMA_ALPHA_INIT else EMA_ALPHA
-        emaF0 = alpha * rawF0 + (1f - alpha) * emaF0
-        emaFrameCount++
-        if (emaFrameCount % 30 == 0) {  // log every ~4s
-            CaptionLogger.log("HindiTTS",
-                "EMA-F0: ${emaF0.toInt()}Hz raw=${rawF0.toInt()}Hz " +
-                "ratio=${String.format("%.2f", exactPitchRatio(emaF0, gender == Gender.FEMALE))}",
-                CaptionLogger.LEVEL_DEBUG)
-        }
+    @Volatile var sentenceF0     : Float = 0f
+    @Volatile var sentenceGender : Gender = Gender.AUTO
+    private val f0SentenceBuffer = java.util.concurrent.CopyOnWriteArrayList<Float>()
+
+    fun addF0Frame(f0: Float, gender: Gender) {
+        if (f0 <= 60f) return
+        if (gender != sentenceGender) { f0SentenceBuffer.clear(); sentenceGender = gender }
+        f0SentenceBuffer.add(f0)
+        if (f0SentenceBuffer.size > 300) f0SentenceBuffer.removeAt(0)
     }
 
-    fun resetEma() {
-        emaF0 = 0f; emaGender = Gender.AUTO; emaFrameCount = 0
+    // Called at sentence commit (flushContour) — computes robust median and locks it
+    fun lockSentenceF0(): Float {
+        val frames = f0SentenceBuffer.toList().filter { it > 60f }
+        if (frames.isEmpty()) return sentenceF0.takeIf { it > 0f } ?: 0f
+        val sorted = frames.sorted()
+        val median = sorted[sorted.size / 2]
+        val q1 = sorted[sorted.size / 4]; val q3 = sorted[3 * sorted.size / 4]
+        val iqr = q3 - q1
+        val filtered = sorted.filter { it >= median - 1.5f * iqr && it <= median + 1.5f * iqr }
+        val robust = if (filtered.isNotEmpty()) filtered[filtered.size / 2] else median
+        sentenceF0 = robust
+        currentMeasuredF0 = robust
+        val isFemale = sentenceGender == Gender.FEMALE
+        CaptionLogger.log("HindiTTS",
+            "SENTENCE-F0: ${robust.toInt()}Hz (${frames.size} frames) " +
+            "ratio=${String.format("%.2f", exactPitchRatio(robust, isFemale))}")
+        f0SentenceBuffer.clear()
+        return robust
     }
 
-    // Stable pitch ratio using EMA F0 — same speaker always sounds consistent
+    fun resetSentenceF0() {
+        sentenceF0 = 0f; sentenceGender = Gender.AUTO; f0SentenceBuffer.clear()
+    }
+
+        // Stable pitch ratio using EMA F0 — same speaker always sounds consistent
     // ── VoiceProfile → TTS parameter mapping ─────────────────────────────────
     // Called by VoiceAnalyzer every ~2s with updated vocal metrics.
     // Maps each measured metric directly to Android TTS parameters.
@@ -148,11 +157,10 @@ object HindiTtsService {
 
         // ── Category 1: F0 → pitch ratio (exact measured Hz) ─────────────────
         // Use measured meanF0 directly — overrides EMA when profile is fresh
+        // Feed VoiceProfile meanF0 into sentence buffer (VoiceAnalyzer profile
+        // averages over ~2s which is roughly one sentence — feeds the buffer)
         if (profile.meanF0 > 60f) {
-            val measuredRatio = exactPitchRatio(profile.meanF0, isFemale)
-            // Blend with EMA for stability (EMA still smooths rapid changes)
-            if (emaF0 <= 0f) emaF0 = profile.meanF0
-            else emaF0 = 0.3f * profile.meanF0 + 0.7f * emaF0
+            addF0Frame(profile.meanF0, if (isFemale) Gender.FEMALE else Gender.MALE)
         }
 
         // ── Category 2: Spectral centroid → pitch brightness trim ────────────
@@ -209,7 +217,7 @@ object HindiTtsService {
         syllableRateAdjustment = syllableRateAdj
 
         CaptionLogger.log("HindiTTS",
-            "PROFILE-APPLIED: pitch=${if (emaF0>0f) emaF0.toInt() else 0}Hz " +
+            "PROFILE-APPLIED: sentF0=${sentenceF0.toInt()}Hz meanF0=${profile.meanF0.toInt()}Hz " +
             "centrimTrim=${"%.2f".format(centroidTrim)} " +
             "fluxAdj=${"%.2f".format(fluxRate)} " +
             "syllAdj=${"%.2f".format(syllableRateAdj)} " +
@@ -223,7 +231,7 @@ object HindiTtsService {
     @Volatile var voiceTextureEmotion: HindiTtsService.Emotion? = null
 
     fun stablePitchRatio(isFemale: Boolean): Float = when {
-        emaF0 > 0f -> exactPitchRatio(emaF0, isFemale)
+        sentenceF0 > 0f -> exactPitchRatio(sentenceF0, isFemale)
         currentMeasuredF0 > 0f -> exactPitchRatio(currentMeasuredF0, isFemale)
         else -> 1.0f
     }
@@ -481,13 +489,14 @@ object HindiTtsService {
         // before GenderAnalyzer has gathered enough samples.
         val hasSpecificVoice = if (isFemale) voiceFemale != null else voiceMale != null
 
-        // EMA-smoothed pitch ratio — same speaker always gets the same base pitch.
-        // stablePitchRatio() reads from emaF0 (slow-changing EMA) not raw currentMeasuredF0.
+        // Per-sentence locked median — same voice throughout each sentence.
+        // stablePitchRatio() reads from sentenceF0 (locked median per sentence).
+        // Per-sentence locked median F0 — ONE stable pitch for the whole sentence
         val basePitch: Float = when {
-            emaF0 > 0f             -> stablePitchRatio(isFemale)          // EMA stable: fully consistent
-            currentMeasuredF0 > 0f -> exactPitchRatio(currentMeasuredF0, isFemale)  // accumulating
-            hasSpecificVoice       -> 1.0f       // no data, voice handles gender
-            isFemale               -> 1.15f      // no data, no specific voice
+            sentenceF0 > 0f        -> stablePitchRatio(isFemale)   // locked median: fully consistent
+            currentMeasuredF0 > 0f -> exactPitchRatio(currentMeasuredF0, isFemale)
+            hasSpecificVoice       -> 1.0f
+            isFemale               -> 1.15f
             else                   -> 0.88f
         }
 
@@ -762,7 +771,7 @@ object HindiTtsService {
         val hasContour    = startF0 > 0f || peakF0 > 0f || endF0 > 0f
 
         if (!hasMultiPoint && !hasContour) {
-            val bPct = f0ToPct(if (emaF0 > 0f) emaF0 else naturalF0)
+            val bPct = f0ToPct(if (sentenceF0 > 0f) sentenceF0 else if (currentMeasuredF0 > 0f) currentMeasuredF0 else naturalF0)
             return "<speak><prosody pitch='${pctStr(bPct)}'>${esc(text)}</prosody></speak>"
         }
 
@@ -779,7 +788,7 @@ object HindiTtsService {
             val interpF0: Float = if (hasMultiPoint && capturedF0Curve[curvePos] > 0f) {
                 capturedF0Curve[curvePos]
             } else {
-                val sF0 = if (startF0 > 0f) startF0 else (emaF0.takeIf { it > 0f } ?: naturalF0)
+                val sF0 = if (startF0 > 0f) startF0 else (sentenceF0.takeIf { it > 0f } ?: naturalF0)
                 val pF0 = if (peakF0 > 0f) peakF0 else sF0
                 val eF0 = if (endF0 > 0f) endF0 else sF0
                 if (t <= 0.5f) sF0 + (pF0 - sF0) * (t * 2f)
