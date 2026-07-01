@@ -507,7 +507,7 @@ object HindiTtsService {
     // Build SSML with emotion-specific texture BEYOND just pitch/rate
     // SSML <break>, <emphasis>, and per-word <prosody> give expressive emotions
     // texture that setPitch() alone cannot achieve.
-    private fun emotionSsml(text: String, emotion: Emotion, basePitchPct: String): String {
+    private fun emotionSsml(text: String, emotion: Emotion, basePitchPct: String): String? {
         val esc = android.text.Html.escapeHtml(text)
         return when (emotion) {
             Emotion.CRYING -> {
