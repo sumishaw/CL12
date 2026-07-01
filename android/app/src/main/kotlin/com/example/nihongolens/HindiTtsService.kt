@@ -743,7 +743,6 @@ object HindiTtsService {
 
     private suspend fun synthesizeToFileInner(item: FetchItem): File? =
         withContext(Dispatchers.IO) {
-            withContext(Dispatchers.IO) {
             val localTts = tts ?: return@withContext null
             val outFile = File(cacheDir, "tts_${UUID.randomUUID()}.wav")
 
@@ -1175,5 +1174,4 @@ object HindiTtsService {
 
         return t
     }
-}
 }
