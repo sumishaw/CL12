@@ -37,8 +37,8 @@ class LiveCaptionReader : AccessibilityService() {
         // Covers: navigating to CL main screen, notification bar, app switcher.
         // 3s: enough for user to dismiss and return to video.
         // If LC stays gone > 3s → video genuinely ended/paused → confirm gone.
-        private const val LC_GONE_GRACE_MS  = 3_000L
-        private const val LANG_CONFIRM        = 3
+        private const val LC_GONE_GRACE_MS  = 5_000L  // 5s: covers brief app switches
+        private const val LANG_CONFIRM        = 5   // 5 consecutive: prevents single-word flicker
         private const val LANG_CONFIRM_LOCKED  = 999  // never switches when locked
         private const val QUEUE_CAP        = 500  // never flush while running — FIFO backlog
         private const val STALE_MS         = Long.MAX_VALUE  // backlogs NEVER expire while running
@@ -140,7 +140,7 @@ class LiveCaptionReader : AccessibilityService() {
         // FORCE_COOLDOWN_MS: hard time-based lock after any FORCE submission.
         // Even if 12 new words arrive in 1 second, don't force-submit again.
         // 3s cooldown: 12-word chunk takes ~1.2s to translate → 3s gives 2.5× margin
-        private const val FORCE_COOLDOWN_MS  = 2_500L  // 0.8s translate + 1.7s margin
+        private const val FORCE_COOLDOWN_MS  = 1_500L  // 1.5s: handles fast speakers  // 0.8s translate + 1.7s margin
 
         private val LC_PACKAGES = setOf(
             "com.google.android.as",
@@ -448,11 +448,14 @@ class LiveCaptionReader : AccessibilityService() {
                 if (++pendingCount >= LANG_CONFIRM) {
                     CaptionLogger.log(TAG, "LANG $confirmedLang->$script")
                     confirmedLang = script; pendingLang = ""; pendingCount = 0
+                    // INTERFERENCE FIX: Do NOT clear queue on lang switch.
+                    // Sentences already queued were translated correctly — don't drop them.
+                    // Only reset text-tracking state so next sentence starts fresh.
                     lastEnqueued = ""; lastRawFull = ""; lastEnqueuedSents.clear()
                     sentenceBuffer = ""; lastBufferEnqueued = ""
                     lastEnqueuedWordCount = 0; lastEnqueuedText = ""
-                    lastSubmitTotalWords = 0; lastSubmitMs = 0L; lastForcedMs = 0L
-                    queue.clear()
+                    lastSubmitTotalWords = 0; lastSubmitMs = 0L
+                    // Don't reset lastForcedMs — prevents immediate FORCE on lang switch
                 }
             } else { pendingLang = script; pendingCount = 1 }
         } else { pendingLang = ""; pendingCount = 0 }
@@ -580,8 +583,8 @@ class LiveCaptionReader : AccessibilityService() {
                         CaptionLogger.log(TAG, "SMART-COMPLETE wc=${wc(t)} — fast silence 500ms")
                         500L   // complete sentence: translate quickly
                     } else {
-                        CaptionLogger.log(TAG, "SMART-INCOMPLETE wc=${wc(t)} — slow silence 1400ms")
-                        900L   // reduced from 1400ms for continuous dialogue flow
+                        CaptionLogger.log(TAG, "SMART-INCOMPLETE wc=${wc(t)} — silence 700ms")
+                        700L   // 700ms: faster response for rapid dialogue
                     }
                 } else {
                     900L  // short text: 900ms (was 1400ms — too slow for dialogue)
@@ -773,8 +776,14 @@ class LiveCaptionReader : AccessibilityService() {
             // Now: every successfully translated sentence reaches TTS
 
             if (result == null) {
-                errCount.incrementAndGet()
+                val ec = errCount.incrementAndGet()
                 CaptionLogger.log(TAG, "ERR ${ms}ms '${text.take(40)}'")
+                // After 3 consecutive errors: brief pause to let server recover
+                // This prevents a stalled server from blocking the queue indefinitely
+                if (ec % 3 == 0L) {
+                    CaptionLogger.log(TAG, "ERR-RESET: 3 consecutive errors — pausing 1s")
+                    kotlinx.coroutines.delay(1_000L)
+                }
                 continue
             }
 
