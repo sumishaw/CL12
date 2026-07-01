@@ -184,6 +184,14 @@ class MainActivity : FlutterActivity() {
 
                 // ── Log viewer ────────────────────────────────────────────────
 
+                "setLockedLang" -> {
+                    val lang = call.arguments as? String ?: ""
+                    LiveCaptionReader.instance?.lockedLang = lang
+                    CaptionLogger.log("MainActivity", "LANG-LOCK → '${lang.ifEmpty { "auto" }}'")
+                    result.success(null)
+                }
+                "getLockedLang" -> result.success(LiveCaptionReader.instance?.lockedLang ?: "")
+
                 "getLogs" -> {
                     val n = (call.arguments as? Int) ?: 300
                     result.success(CaptionLogger.getRecentLines(n))
