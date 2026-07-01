@@ -257,6 +257,20 @@ object GenderAnalyzer {
     private var sustainedHighF0Frames = 0
     private var emotionFrameCount = 0
 
+    // ── F0 Contour tracking (for SSML prosody mirroring) ─────────────────────
+    // We track F0 at 3 key points in each sentence window:
+    //   startF0: average of first 8 frames (how the speaker begins the phrase)
+    //   peakF0:  highest sustained F0 in the window (where energy/stress peaks)
+    //   endF0:   average of last 8 frames (how the phrase ends — falling/rising)
+    // These 3 points define the pitch CONTOUR of the original utterance, which
+    // we then map to SSML <prosody pitch> tags so the Hindi TTS follows the
+    // same intonation shape — rising, falling, peaked, or flat.
+    private val contourBuffer  = ArrayDeque<Float>(80)  // ~10s of F0 frames
+    private var contourPeak    = 0f
+    @Volatile var lastContourStartF0: Float = 0f   // read by HindiTtsService
+    @Volatile var lastContourPeakF0:  Float = 0f
+    @Volatile var lastContourEndF0:   Float = 0f
+
     // ── Voice Type classification state ──────────────────────────────────────
     // Wider rolling window than emotion detection (5s vs 640ms) — voice type is
     // a STABLE characteristic of the speaker, not a moment-to-moment emotional cue.
@@ -299,6 +313,14 @@ object GenderAnalyzer {
         }
 
         // ── Voice Type classification ─────────────────────────────────────────
+        // ── F0 Contour: accumulate for start/peak/end detection ────────────
+        if (f0 > 0f) {
+            contourBuffer.addLast(f0)
+            if (contourBuffer.size > 80) contourBuffer.removeFirst()
+            if (f0 > contourPeak) contourPeak = f0
+        }
+
+        // ── Voice Type classification (wider rolling window) ──────────────────
         // Wider rolling window (~5s) of F0 samples → classify into one of 6
         // standard voice types (Soprano/Mezzo/Contralto/Countertenor/Tenor/
         // Baritone/Bass) based on the SPEAKER'S average speaking pitch.
@@ -364,6 +386,31 @@ object GenderAnalyzer {
             }
             risingFrames = 0; fallingFrames = 0; highEnergyFrames = 0
         }
+    }
+
+    // ── F0 Contour Extractor ─────────────────────────────────────────────────
+    // Called by Livecaptionreader when a sentence is about to be enqueued for
+    // translation. Extracts the 3-point pitch contour from the accumulated F0
+    // buffer and writes it to HindiTtsService for SSML generation.
+    fun flushContour() {
+        val buf = contourBuffer.toList().filter { it > 0f }
+        if (buf.size < 10) return
+        val n = buf.size
+        val startF0 = buf.take(minOf(8, n/4)).average().toFloat()
+        val endF0   = buf.takeLast(minOf(8, n/4)).average().toFloat()
+        val peakF0  = contourPeak.takeIf { it > 0f } ?: buf.max()
+        lastContourStartF0 = startF0
+        lastContourPeakF0  = peakF0
+        lastContourEndF0   = endF0
+        HindiTtsService.capturedStartF0 = startF0
+        HindiTtsService.capturedPeakF0  = peakF0
+        HindiTtsService.capturedEndF0   = endF0
+        CaptionLogger.log("GenderAnalyzer",
+            "CONTOUR start=${startF0.toInt()} peak=${peakF0.toInt()} end=${endF0.toInt()}Hz " +
+            if (endF0 > startF0 * 1.05f) "↑RISING" else if (endF0 < startF0 * 0.95f) "↓FALLING" else "→FLAT")
+        // Reset for next sentence
+        contourBuffer.clear()
+        contourPeak = 0f
     }
 
     // ── Voice Type Classifier ────────────────────────────────────────────────
