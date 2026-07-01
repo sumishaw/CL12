@@ -154,7 +154,7 @@ class OverlayService : Service() {
 
         if (holdMs == 0L) {
             // Live mode: show immediately, replace whatever is showing
-            cancelTimers()
+            cancelAllTimers()  // cancel ALL including stale silenceRunnable
             active = false
             backlog.clear()
             backlog.offer(Item(token, hindi.trim()))
@@ -183,7 +183,7 @@ class OverlayService : Service() {
     // Shows FULL sentence immediately. Holds until next sentence or holdMs expires.
 
     private fun advance() {
-        cancelTimers()
+        cancelAllTimers()  // cancel ALL timers including stale silenceRunnable
 
         // Drain stale tokens
         while (true) {
@@ -228,16 +228,13 @@ class OverlayService : Service() {
     // Called when TTS finishes speaking one sentence.
     // Advances display to next queued subtitle (FIFO), or fades out if empty.
     private fun onTtsComplete() {
-        cancelTimers()
+        cancelAllTimers()  // cancel ALL including any stale silenceRunnable
         if (backlog.isNotEmpty()) {
             active = false
-            advance()
+            advance()  // advance() will reschedSilence via setTextDirect
+        } else {
+            reschedSilence()  // nothing queued — just keep timer alive
         }
-        // Always reschedule silence timer after TTS completes.
-        // cancelTimers() above killed it — without this, the timer is dead
-        // and the overlay stays on last sentence forever until the next
-        // setTextDirect() call (which may never come if TTS pipeline stalls).
-        reschedSilence()
     }
 
     // ── View helpers ──────────────────────────────────────────────────────────
@@ -278,33 +275,41 @@ class OverlayService : Service() {
             }?.start()
     }
 
+    private fun cancelAllTimers() {
+        wordRunnable?.let    { handler.removeCallbacks(it) }
+        holdRunnable?.let    { handler.removeCallbacks(it) }
+        silenceRunnable?.let { handler.removeCallbacks(it) }
+        wordRunnable = null; holdRunnable = null; silenceRunnable = null
+    }
+
     private fun cancelTimers() {
+        // Cancel hold/word timers only — preserves silenceRunnable
+        // Use cancelAllTimers() when you also need to stop the silence timer
         wordRunnable?.let { handler.removeCallbacks(it) }
         holdRunnable?.let { handler.removeCallbacks(it) }
         wordRunnable = null; holdRunnable = null
     }
 
+    private var silenceGeneration = 0  // incremented on every reschedule to invalidate stale runnables
+
     private fun reschedSilence() {
         silenceRunnable?.let { handler.removeCallbacks(it) }
-        val scheduledAt = System.currentTimeMillis()
-        silenceRunnable = Runnable {
-            val elapsed = System.currentTimeMillis() - scheduledAt
+        silenceRunnable = null
+        val gen = ++silenceGeneration
+        val r = Runnable {
+            if (gen != silenceGeneration) return@Runnable  // stale — a newer one was scheduled
             val timeSinceLastText = System.currentTimeMillis() - lastTextShownMs
-            // Only fade when ALL of these are true:
-            // 1. No backlog and not active
-            // 2. TTS not speaking
-            // 3. Last subtitle was shown > 290s ago (nearly the full 300s window)
-            //    — prevents false fade when sentences are still flowing
             if (backlog.isEmpty() && !active && !HindiTtsService.isSpeaking
                 && timeSinceLastText >= 290_000L) {
-                CaptionLogger.log("Overlay", "silence-timer: genuinely idle ${timeSinceLastText/1000}s → fade")
+                CaptionLogger.log("Overlay", "silence-timer: idle ${timeSinceLastText/1000}s → fade")
                 fadeOut()
             } else {
-                CaptionLogger.log("Overlay", "silence-timer: content active (lastText ${timeSinceLastText/1000}s ago) → reschedule")
-                reschedSilence()  // keep rescheduling while content is flowing
+                CaptionLogger.log("Overlay", "silence-timer: active → reschedule", CaptionLogger.LEVEL_DEBUG)
+                reschedSilence()
             }
         }
-        handler.postDelayed(silenceRunnable!!, 300_000)  // 5 min: covers long silent scenes
+        silenceRunnable = r
+        handler.postDelayed(r, 300_000L)
     }
 
     // ── Overlay window ────────────────────────────────────────────────────────
