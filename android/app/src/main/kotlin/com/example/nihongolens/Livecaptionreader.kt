@@ -154,6 +154,72 @@ class LiveCaptionReader : AccessibilityService() {
             "com.google.android.tts",
         )
 
+        // ── INTERJECTIONS / FILLERS ───────────────────────────────────────────
+        // Short non-lexical utterances that carry tone, not meaning. Sending
+        // these through CT2 translation produces unrelated/garbled Hindi phrases
+        // (translation models treat them as real words needing a real gloss).
+        // Instead we map each one directly to a natural Devanagari rendering so
+        // the existing hi-IN TTS voice pronounces it correctly, while the
+        // speaker-matched pitch/rate/emotion pipeline (GenderAnalyzer contour)
+        // still applies exactly as it does for normal sentences — same voice,
+        // just the original interjection instead of a mistranslated one.
+        // Multiple English spellings can map to the same/similar rendering;
+        // that's intentional — they're the same sound, spelled differently.
+        val INTERJECTIONS: Map<String, String> = mapOf(
+            // Affirmation & Agreement
+            "yeah"    to "याह",
+            "yah"     to "याह",
+            "yep"     to "येप",
+            "yup"     to "यप",
+            "uh-huh"  to "अ-हा",
+            "uhhuh"   to "अ-हा",
+            "aha"     to "आहा",
+            "yo"      to "यो",
+
+            // Negation & Disagreement
+            "nope"    to "नोप",
+            "nah"     to "ना",
+            "uh-uh"   to "अ-अ",
+            "uhuh"    to "अ-अ",
+            "nix"     to "निक्स",
+
+            // Hesitation Fillers
+            "um"      to "अम्म",
+            "umm"     to "अम्म",
+            "uh"      to "अह",
+            "er"      to "अर",
+            "hmm"     to "हम्म्",
+            "hmmm"    to "हम्म्",
+            "mm"      to "म्म्",
+            "mmm"     to "म्म्",
+            "eh"      to "एह",
+
+            // Realisation & Surprise
+            "oh"      to "ओह",
+            "ah"      to "आह",
+            "aah"     to "आआह",
+            "oho"     to "ओहो",
+            "wow"     to "वाओ",
+            "ooh"     to "ऊह",
+            "whoa"    to "व्होआ",
+
+            // Pain, Disgust & Disappointment
+            "ow"      to "आउ",
+            "ouch"    to "आउच",
+            "ugh"     to "अघ्ह",
+            "yuck"    to "यक",
+            "ew"      to "इव",
+            "eww"     to "इव",
+            "oof"     to "ऊफ",
+            "alas"    to "अलास",
+
+            // Greetings & Attention Seekers
+            "hey"     to "हे",
+            "hi"      to "हाय",
+            "oi"      to "ओइ",
+            "psst"    to "प्स्स्त्",
+        )
+
         @Volatile var isRunning = false
         @Volatile var instance: LiveCaptionReader? = null
     }
@@ -164,7 +230,14 @@ class LiveCaptionReader : AccessibilityService() {
     private var watchdogJob:  Job? = null
 
     // FIFO + tokens
-    private data class QItem(val seq: Long, val text: String, val enqMs: Long = System.currentTimeMillis())
+    private data class QItem(
+        val seq: Long,
+        val text: String,
+        val enqMs: Long = System.currentTimeMillis(),
+        // Set for interjections only: worker delivers this directly instead of
+        // calling the CT2 translation server. Null for normal sentences.
+        val presetHindi: String? = null,
+    )
     private val queue      = LinkedBlockingQueue<QItem>()
     private val seqCounter = AtomicLong(0)
     // Thread-safe set: tracks texts currently being translated by any worker
@@ -515,6 +588,38 @@ class LiveCaptionReader : AccessibilityService() {
 
         val newWords = wc(untranslated)
 
+        // ── RULE 0: INTERJECTION — immediate fire, bypasses every gate below ──
+        // Single fillers/exclamations ("Um", "Wow", "Nope"...) are complete on
+        // their own. The normal rules below all wait for either punctuation or
+        // 3+ new words before firing — a lone filler with no trailing punctuation
+        // (very common: LC often shows "Um" or "Hmm" with nothing after it) would
+        // otherwise sit in sentenceBuffer and NEVER get submitted. And even when
+        // it does reach translation, CT2 tends to mangle single interjections into
+        // unrelated Hindi phrases. So: detect them here, skip CT2 entirely, and
+        // speak a natural Hindi-script rendering directly — same speaker pitch/
+        // rate/emotion pipeline (GenderAnalyzer contour) applies exactly as usual,
+        // just without the translation round-trip.
+        val interjectionHindi = matchInterjection(untranslated)
+        if (interjectionHindi != null) {
+            sentenceTimerJob?.cancel(); pendingJob?.cancel()
+            sentenceBuffer = untranslated
+            val fireWords  = totalWords
+            pendingJob = scope.launch {
+                delay(80)
+                val t = sentenceBuffer.trim()
+                if (t.isNotBlank() && t != lastEnqueuedText) {
+                    CaptionLogger.log(TAG, "INTERJECTION '$t' → '$interjectionHindi'")
+                    lastSubmitTotalWords = fireWords
+                    lastSubmitMs         = System.currentTimeMillis()
+                    lastEnqueuedText     = t
+                    sentenceBuffer       = ""
+                    GenderAnalyzer.flushContour()
+                    enqueueInterjection(t, interjectionHindi)
+                }
+            }
+            return
+        }
+
         // ── COOLDOWN: Prevent re-submitting same text repeatedly ──────────────
         // CT2 TIMEOUT cascade: without this, same sentence submitted 10x → 50s stuck
         // Gate: only submit when 4+ NEW total words have arrived since last submission
@@ -715,6 +820,78 @@ class LiveCaptionReader : AccessibilityService() {
         CaptionLogger.log(TAG, "ENQ seq=$seq q=${queue.size} '${text.take(60)}'")
     }
 
+    // Extra common fillers/interjections beyond the curated list — recognized
+    // as "don't translate this" but with no fabricated Hindi transliteration.
+    // Per requirement: if we don't have a confident Hindi rendering, speak the
+    // original English word as-is rather than guessing or sending to CT2.
+    private val INTERJECTION_VERBATIM = setOf(
+        "huh", "meh", "duh", "argh", "grr", "grrr", "phew", "shh", "shhh",
+        "tsk", "gosh", "geez", "jeez", "darn", "oops", "yay", "yikes",
+        "bravo", "boo", "aw", "aww", "awww", "blah", "ta", "cheers", "bingo",
+    )
+
+    // Matches text against the interjection table, handling:
+    //  1. Single tokens ("Wow!", "wow.", "WOW") → curated Hindi rendering
+    //  2. Single tokens with no curated mapping but recognized as a filler
+    //     ("Huh?", "Meh") → spoken verbatim in the original English
+    //  3. Two-word compounds ("uh huh", "uh, huh", "uh uh") → ASR almost never
+    //     hyphenates these the way they're written ("uh-huh"/"uh-uh"), it comes
+    //     back as separate words, so this must be checked as a joined form too
+    // Returns the exact text that should be handed to TTS, or null if this
+    // isn't a recognized interjection at all (falls through to normal handling).
+    private fun matchInterjection(text: String): String? {
+        val cleaned = text.trim().trim('!', '?', '.', ',', ';', ':', '"', '\'', '…').trim()
+        if (cleaned.isEmpty()) return null
+        val lower = cleaned.lowercase()
+
+        if (!lower.contains(' ')) {
+            INTERJECTIONS[lower]?.let { return it }
+            if (lower in INTERJECTION_VERBATIM) return cleaned
+            return null
+        }
+
+        // Multi-word: strip internal punctuation/spaces and retry as one
+        // token — covers "uh huh", "uh, huh", "uh-huh" all landing on the
+        // same lookup key regardless of how ASR happened to punctuate it.
+        val joined = lower.replace(Regex("[^a-z]"), "")
+        INTERJECTIONS[joined]?.let { return it }
+        if (joined in INTERJECTION_VERBATIM) return cleaned
+        return null
+    }
+
+    // Lightweight sibling of enqueue() for single-word interjections/fillers.
+    // Skips the min-length (4 char) and min-word-count (2 word) checks in
+    // enqueue() — both of which exist to filter out fragment noise, but would
+    // reject every legitimate interjection ("um", "hi", "oh" are all under
+    // 4 chars or a single word). Skips the romanized-Hindi guard too — it's
+    // irrelevant here since we already know exactly what this word is.
+    private fun enqueueInterjection(text: String, hindiPhonetic: String) {
+        val n = norm(text)
+        if (n == lastEnqueued || n == norm(lastSentText)) {
+            CaptionLogger.log(TAG, "SKIP dup interjection")
+            return
+        }
+        lastEnqueued = n
+        val seq = seqCounter.incrementAndGet()
+
+        if (queue.size >= QUEUE_CAP) {
+            val oldest = queue.peek()
+            val oldestAge = if (oldest != null) System.currentTimeMillis() - oldest.enqMs else 0L
+            if (oldestAge > STALE_MS) {
+                val cleared = queue.size
+                queue.clear()
+                CaptionLogger.log(TAG, "SKIP-AHEAD: cleared $cleared stale items, going to latest")
+            } else {
+                CaptionLogger.log(TAG, "CAP: queue full q=${queue.size}")
+                return
+            }
+        }
+
+        queue.offer(QItem(seq, text, presetHindi = hindiPhonetic))
+        enqCount.incrementAndGet()
+        CaptionLogger.log(TAG, "ENQ-INTERJECTION seq=$seq q=${queue.size} '$text' → '$hindiPhonetic'")
+    }
+
     // ── Translation worker ────────────────────────────────────────────────────
 
     private var translateJob2: Job? = null
@@ -750,6 +927,12 @@ class LiveCaptionReader : AccessibilityService() {
             val seq   = item.seq
             val text  = item.text
             val ageMs = System.currentTimeMillis() - item.enqMs
+
+            // Interjection fast-path: already know the Hindi rendering, no CT2 call needed
+            if (item.presetHindi != null) {
+                deliverHindi(seq, text, item.presetHindi, name, 0L)
+                continue
+            }
 
             // FIFO: removed seq < expectedSeq check — all queued sentences translate in order
             // CRITICAL FIX: Drop sentences >5s old (was 15s)
