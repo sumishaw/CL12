@@ -581,6 +581,41 @@ object GenderAnalyzer {
             vibratoDetected = vibratoRateHz in 3.5f..9f && relativeDeviation > 0.01f
         }
 
+        // ── Automatic singing detection (Voice Mimic Engine Phase 3) ──────────
+        // Combines three signals, reusing data already computed above:
+        //   1. Vibrato present — strong, specific singing indicator on its own
+        //   2. Wide pitch range — singing typically spans more semitones than
+        //      speech's natural intonation range
+        //   3. Sustained energy — held notes have steadier RMS than the
+        //      naturally choppy energy pattern of spoken syllables
+        // Trusts vibrato alone, OR requires the other two together (covers
+        // monotone/chant-like singing that has little audible vibrato).
+        //
+        // HONEST LIMIT: this DETECTS that singing is likely happening. It
+        // does not mean Android TTS can actually preserve note lengths,
+        // rhythm, or real vibrato when reproducing it — see the comments in
+        // HindiTtsService.buildSingingContour() for what's actually achieved.
+        var singingDetected = false
+        if (n >= 20) {
+            val voicedF0 = f0Buf.filter { it > 60f }
+            val f0Min = voicedF0.minOrNull() ?: 0f
+            val f0Max = voicedF0.maxOrNull() ?: 0f
+            val pitchRangeSemitones = if (f0Min > 0f && f0Max > 0f)
+                12f * (kotlin.math.ln(f0Max / f0Min) / kotlin.math.ln(2f)) else 0f
+
+            val rmsValues = rmsBuf.filter { it > 0f }
+            val rmsMean = if (rmsValues.isNotEmpty()) rmsValues.average().toFloat() else 0f
+            val rmsStability = if (rmsValues.size > 1 && rmsMean > 0f) {
+                val variance = rmsValues.sumOf { ((it - rmsMean) * (it - rmsMean)).toDouble() } / rmsValues.size
+                1f - (kotlin.math.sqrt(variance).toFloat() / rmsMean).coerceIn(0f, 1f)
+            } else 0f
+
+            val wideRange       = pitchRangeSemitones > 5f    // >5 semitones — more than typical speech intonation
+            val sustainedEnergy = rmsStability > 0.55f         // fairly stable energy = held notes, not choppy speech
+
+            singingDetected = vibratoDetected || (wideRange && sustainedEnergy)
+        }
+
         // Legacy 3-point fields (still used as fallback)
         lastContourStartF0 = capturedF0Curve[0]
         lastContourPeakF0  = capturedF0Curve.max()
@@ -595,6 +630,7 @@ object GenderAnalyzer {
         HindiTtsService.capturedVibratoDetected = vibratoDetected
         HindiTtsService.capturedVibratoRateHz   = vibratoRateHz
         HindiTtsService.capturedBreathCount     = breathCountThisSentence
+        HindiTtsService.capturedSingingDetected = singingDetected
         breathCountThisSentence = 0
         silentHopStreak = 0
 
@@ -605,7 +641,8 @@ object GenderAnalyzer {
         }
         CaptionLogger.log("GenderAnalyzer",
             "CONTOUR-${CONTOUR_POINTS}pt [${capturedF0Curve.map{it.toInt()}.joinToString(",")}] $shape" +
-            if (vibratoDetected) " VIBRATO=${vibratoRateHz.format1()}Hz" else "")
+            (if (vibratoDetected) " VIBRATO=${vibratoRateHz.format1()}Hz" else "") +
+            (if (singingDetected) " SINGING" else ""))
 
         // Lock per-sentence median F0 — computed from all voiced frames this sentence
         // This gives HindiTtsService ONE stable base pitch for the whole sentence
