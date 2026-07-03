@@ -232,6 +232,11 @@ object HindiTtsService {
     // evenly through the translated sentence, not treat it as precise
     // alignment.
     @Volatile var capturedBreathCount: Int = 0
+    // Automatic singing detection (Phase 3) — combines vibrato, pitch range,
+    // and energy sustain in GenderAnalyzer.flushContour(). See
+    // buildSingingContour() for what's actually done with this — Android TTS
+    // cannot truly preserve note lengths/rhythm/vibrato, only approximate them.
+    @Volatile var capturedSingingDetected: Boolean = false
 
     // Emotion blending state (see the blend computation in speak() for
     // details) — must persist across calls, since each sentence blends
@@ -569,8 +574,17 @@ object HindiTtsService {
         val profileRate  = (ttsSpeedMultiplier * syllableRateMultiplier).coerceIn(0.5f, 2.0f)
 
         // Use voiceTextureEmotion if active and no other emotion detected
-        val effectiveEmotion = if (voiceTextureEmotion != null && currentEmotion == Emotion.NEUTRAL)
-            voiceTextureEmotion!! else currentEmotion
+        // Precedence: explicit acoustic emotion > detected singing > voice
+        // texture > neutral. Singing detection is a strong, specific signal
+        // (vibrato + pitch range + energy sustain) so it outranks the more
+        // generic voice-texture fallback, but an explicitly detected emotion
+        // (e.g. genuine EXCITED/ANGRY speech) still takes priority over it.
+        val effectiveEmotion = when {
+            currentEmotion != Emotion.NEUTRAL -> currentEmotion
+            capturedSingingDetected           -> Emotion.SINGING
+            voiceTextureEmotion != null       -> voiceTextureEmotion!!
+            else                              -> Emotion.NEUTRAL
+        }
         val (pitchMult2, rateMult2) = emotionPitchRate(effectiveEmotion)
 
         val finalPitch = (profilePitch * pitchMult2).coerceIn(0.75f, 1.45f)  // stay in natural range
@@ -604,12 +618,18 @@ object HindiTtsService {
         // Snapshot background music sequence at enqueue time for timing alignment
         val bgSeq = BackgroundMusicRecorder.currentSeq.get()
 
-        CaptionLogger.log(TAG, "SPEAK emo=$currentEmotion spd=${String.format("%.2f", blendedRate)} " +
+        CaptionLogger.log(TAG, "SPEAK emo=$effectiveEmotion(raw=$currentEmotion) spd=${String.format("%.2f", blendedRate)} " +
             "pitch=${String.format("%.2f", blendedPitch)} $genderTag " +
             "F0=${currentMeasuredF0.toInt()}Hz voiceType=$currentVoiceType bg=$bgSeq '${n.take(50)}'")
 
+        // FIX: was `currentEmotion` — that meant effectiveEmotion (which
+        // includes singing detection and voice-texture fallback) only ever
+        // affected the pitch/rate multipliers above, never the actual SSML
+        // template dispatch in emotionSsml(), which reads item.emotion.
+        // Singing detection would have computed correctly but never actually
+        // routed to buildSingingContour(). Now it does.
         fetchQueue.offer(FetchItem(n, genderTag, blendedPitch, blendedRate, srcText,
-            currentEmotion, bgSeq, System.currentTimeMillis()))
+            effectiveEmotion, bgSeq, System.currentTimeMillis()))
     }
 
     // ── Fetch worker: Android TTS → WAV file ──────────────────────────────────
@@ -868,6 +888,100 @@ object HindiTtsService {
         return "<speak><prosody rate='medium'>$tagged</prosody></speak>"
     }
 
+    // ── Singing Mode (Phase 3) ─────────────────────────────────────────────
+    // Same foundation as buildMelodyContour, tuned for singing rather than
+    // speech. HONEST LIMITS, stated plainly: Android TTS cannot preserve
+    // actual note lengths, rhythm, or true vibrato — it has no note-level
+    // duration control and no pitch-oscillation API at all. What follows is
+    // the closest approximation achievable within those constraints:
+    //   - Melody followed more FAITHFULLY (less damping) than speech, since
+    //     exaggerated pitch movement is expected and correct in singing
+    //   - Vibrato wobble is STRONGER and scaled to the actual measured rate,
+    //     not a fixed small nudge — still not real vibrato, just a bigger,
+    //     more rate-aware approximation of it
+    //   - "Rhythm/note length" is approximated by slowing down words that
+    //     fall in a sustained-energy run (a held note tends to have stable,
+    //     sustained RMS) rather than the speech-stress-based pacing used
+    //     for ordinary dialogue in buildMelodyContour
+    private fun buildSingingContour(text: String, curve: FloatArray, rmsCurve: FloatArray, basePitchPct: String): String? {
+        val words = text.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
+        if (words.size < 2) return null
+
+        val validPts = curve.filter { it > 60f }
+        if (validPts.size < 3) return null
+        val meanF0 = validPts.average().toFloat()
+        if (meanF0 <= 0f) return null
+
+        val validRms = rmsCurve.filter { it > 0f }
+        val meanRms  = if (validRms.isNotEmpty()) validRms.average().toFloat() else 0f
+
+        val basePct    = basePitchPct.removeSuffix("%").toFloatOrNull() ?: 0f
+        val maxStepPct = 10f   // wider than speech's 6% — singing's larger pitch swings need more room per step
+        var prevPct    = basePct
+
+        val maxRateStepPct = 12f
+        var prevRatePct    = 100f
+
+        // Vibrato wobble scaled to the ACTUAL measured rate — faster
+        // detected vibrato alternates more per word, slower vibrato less so,
+        // rather than a fixed word-to-word flip. Still word-granularity
+        // (Android TTS has no finer time control), so this is a rough
+        // rate-aware approximation, not a real reproduction.
+        val vibratoAmplitude = if (capturedVibratoDetected)
+            (capturedVibratoRateHz / 6f * 5f).coerceIn(3f, 8f) else 0f
+
+        val breathCount = capturedBreathCount.coerceIn(0, words.size - 1)
+        val breathAfterWordIdx: Set<Int> = if (breathCount > 0) {
+            (1..breathCount).map { (it * words.size / (breathCount + 1)) }.toSet()
+        } else emptySet()
+
+        val tagged = words.mapIndexed { i, w ->
+            val curveIdx = ((i.toFloat() / (words.size - 1).coerceAtLeast(1)) * (curve.size - 1))
+                .toInt().coerceIn(0, curve.size - 1)
+            val rawF0 = curve[curveIdx]
+            // 1.1x deviation scale (vs speech's 0.6x) — follow the melody
+            // more faithfully; singing's pitch swings are supposed to be
+            // prominent, not smoothed toward flat like conversational speech
+            var deviationPct = if (rawF0 > 60f) ((rawF0 - meanF0) / meanF0 * 100f * 1.1f) else 0f
+
+            var sustainScore = 0f  // how "held" this word's energy region is
+            if (meanRms > 0f && curveIdx < rmsCurve.size) {
+                val rawRms = rmsCurve[curveIdx]
+                if (rawRms > 0f) {
+                    val energyRatio = (rawRms - meanRms) / meanRms
+                    deviationPct += (energyRatio * 10f).coerceIn(-8f, 8f)
+                    // Sustained = close to the sentence's own average energy
+                    // (not a sharp transient) AND above the floor — held
+                    // notes are steady, not spiky.
+                    sustainScore = (1f - kotlin.math.abs(energyRatio)).coerceIn(0f, 1f)
+                }
+            }
+
+            if (vibratoAmplitude > 0f) {
+                deviationPct += if (i % 2 == 0) vibratoAmplitude else -vibratoAmplitude
+            }
+
+            val targetPct  = basePct + deviationPct
+            val steppedPct = prevPct + (targetPct - prevPct).coerceIn(-maxStepPct, maxStepPct)
+            prevPct = steppedPct
+            val pctStr = if (steppedPct >= 0) "+${steppedPct.toInt()}%" else "${steppedPct.toInt()}%"
+
+            // Rhythm/note-length approximation: a sustained (held-note-like)
+            // word gets slowed down noticeably; a transient/passing word
+            // gets sped up slightly — the closest available proxy for "this
+            // syllable was held longer" without real duration control.
+            val targetRatePct  = (100f - (sustainScore * 25f)).coerceIn(70f, 115f)
+            val steppedRatePct = prevRatePct + (targetRatePct - prevRatePct).coerceIn(-maxRateStepPct, maxRateStepPct)
+            prevRatePct = steppedRatePct
+            val ratePctStr = "${steppedRatePct.toInt()}%"
+
+            val wordTag = "<prosody pitch='$pctStr' rate='$ratePctStr'>${android.text.Html.escapeHtml(w)}</prosody>"
+            if (i in breathAfterWordIdx) "$wordTag<break time='200ms'/>" else wordTag
+        }.joinToString(" ")
+
+        return "<speak><prosody rate='medium'>$tagged</prosody></speak>"
+    }
+
     private fun emotionSsml(text: String, emotion: Emotion, basePitchPct: String): String? {
         val esc = android.text.Html.escapeHtml(text)
         return when (emotion) {
@@ -1061,14 +1175,23 @@ object HindiTtsService {
                 "<speak><prosody rate='medium'>$tagged</prosody></speak>"
             }
             Emotion.SINGING -> {
-                // Genuine sing-song wave — alternating up/down across the phrase,
-                // for accurately dubbing an actual singing moment in the source video
-                val words = text.split(" ")
-                val tagged = words.mapIndexed { i, w ->
-                    val p = when (i % 4) { 0 -> "+20%"; 1 -> "+5%"; 2 -> "+28%"; else -> "+10%" }
-                    "<prosody pitch='$p'>${android.text.Html.escapeHtml(w)}</prosody>"
-                }.joinToString(" ")
-                "<speak><prosody rate='medium'>$tagged</prosody></speak>"
+                // Prefer the REAL measured contour when we have it — the old
+                // canned alternating wave is a worse approximation than
+                // actual captured pitch/vibrato/energy data now that Phase 1
+                // built the machinery to use it. Falls back to the canned
+                // wave only if singing was tagged but this sentence didn't
+                // actually capture usable contour data (e.g. too short).
+                buildSingingContour(text, capturedF0Curve, capturedRmsCurve, basePitchPct)
+                    ?: run {
+                        // Genuine sing-song wave — alternating up/down across the phrase,
+                        // for accurately dubbing an actual singing moment in the source video
+                        val words = text.split(" ")
+                        val tagged = words.mapIndexed { i, w ->
+                            val p = when (i % 4) { 0 -> "+20%"; 1 -> "+5%"; 2 -> "+28%"; else -> "+10%" }
+                            "<prosody pitch='$p'>${android.text.Html.escapeHtml(w)}</prosody>"
+                        }.joinToString(" ")
+                        "<speak><prosody rate='medium'>$tagged</prosody></speak>"
+                    }
             }
             else -> if (emotion == Emotion.NEUTRAL) null
                     else buildMelodyContour(text, capturedF0Curve, capturedRmsCurve, basePitchPct)
