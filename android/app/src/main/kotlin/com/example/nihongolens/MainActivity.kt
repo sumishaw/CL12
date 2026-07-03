@@ -119,7 +119,7 @@ class MainActivity : FlutterActivity() {
                 "requestAudioPermission" ->
                     requestAudioThenProjection(result)
 
-                "checkAccessibilityEnabled" -> result.success(true)
+                "checkAccessibilityEnabled" -> result.success(isLiveCaptionReaderEnabled())
 
                 "isModelReady" -> checkWhisperReady { ready ->
                     runOnUiThread { result.success(ready) }
@@ -340,6 +340,29 @@ class MainActivity : FlutterActivity() {
     }
 
     // ── Idle health polling ───────────────────────────────────────────────────
+
+    // FIX: previously the "checkAccessibilityEnabled" handler always
+    // returned true unconditionally, and the Dart side didn't even call it
+    // — it relied solely on a PASSIVE event fired when LiveCaptionReader's
+    // own onServiceConnected() callback ran. Android's accessibility
+    // service is OS-managed and can keep running independently of the app's
+    // process; if the app restarts while the service is still genuinely
+    // active, that connection callback may not re-fire, so the UI defaulted
+    // to "not allowed" even when the permission was actually still granted.
+    // This queries Android's real system settings directly, so it reflects
+    // the actual current state regardless of whether a fresh connection
+    // event has fired this session.
+    private fun isLiveCaptionReaderEnabled(): Boolean {
+        return try {
+            val expectedComponent = "$packageName/${LiveCaptionReader::class.java.name}"
+            val enabledServices = Settings.Secure.getString(
+                contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+            ) ?: return false
+            enabledServices.split(':').any { it.equals(expectedComponent, ignoreCase = true) }
+        } catch (e: Exception) {
+            false
+        }
+    }
 
     private fun startIdlePoll() {
         stopIdlePoll()
