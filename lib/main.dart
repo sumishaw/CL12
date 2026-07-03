@@ -86,6 +86,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   String  _logStats         = '';
   bool    _logAutoScroll    = true;
   String  _downloadStatus   = '';
+  bool    _hasStoragePermission = false;
   String  _lockedLang       = '';   // '' = auto
   String  _genderDetected   = 'male';
   String  _genderSelected   = 'auto';
@@ -148,6 +149,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       final overlay = await _ch.invokeMethod<bool>('hasOverlayPermission') ?? false;
       if (mounted) setState(() => hasOverlay = overlay);
     } catch (_) {}
+    await _checkStoragePermission();
   }
 
   Future<void> _checkModelStatus() async {
@@ -480,6 +482,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 color: _logAutoScroll ? Colors.greenAccent : Colors.white38, size: 18),
           ),
           const SizedBox(width: 8),
+          // Storage permission button — jumps straight to the per-app "All
+          // files access" screen instead of making the user hunt through
+          // Settings menus (which don't show this permission under the
+          // normal grouped Permissions list at all — it's a special one).
+          GestureDetector(
+            onTap: _requestStoragePermission,
+            child: Icon(Icons.folder_special,
+                color: _hasStoragePermission ? Colors.greenAccent : Colors.orangeAccent, size: 18),
+          ),
+          const SizedBox(width: 8),
           // Download button
           GestureDetector(
             onTap: _downloadLogs,
@@ -618,10 +630,39 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     if (mounted) setState(() => _lockedLang = lang);
   }
 
+  Future<void> _checkStoragePermission() async {
+    final has = await _ch.invokeMethod<bool>('hasManageStoragePermission') ?? false;
+    if (mounted) setState(() => _hasStoragePermission = has);
+  }
+
+  Future<void> _requestStoragePermission() async {
+    final has = await _ch.invokeMethod<bool>('requestManageStoragePermission') ?? false;
+    // If already granted, has=true immediately. If not, this just opened the
+    // settings screen — re-check after the user comes back to the app.
+    if (mounted) setState(() => _hasStoragePermission = has);
+    if (!has && mounted) {
+      setState(() => _downloadStatus =
+          '➡️ Opened "All files access" settings — grant it, then come back and tap the folder icon again to confirm.');
+    }
+  }
+
   Future<void> _downloadLogs() async {
     try {
+      final hasPerm = await _ch.invokeMethod<bool>('hasManageStoragePermission') ?? false;
+      if (mounted) setState(() => _hasStoragePermission = hasPerm);
       final path = await _ch.invokeMethod<String>('downloadLogs') ?? '';
       final isError = path.isEmpty || path.startsWith('Error:');
+
+      if (!hasPerm) {
+        // Without the permission, captionlog/ can't work at all — whatever
+        // happened (fallback succeeded in Downloads/, or even that failed),
+        // the actionable message is the same: grant the permission.
+        final where = isError ? 'nowhere — both attempts failed' : 'Downloads/ (fallback)';
+        if (mounted) setState(() => _downloadStatus =
+            '⚠️ Saved to $where — "All files access" isn\'t granted, so captionlog/ can\'t be used yet. Tap the folder icon above to grant it.');
+        return;
+      }
+
       if (mounted) setState(() => _downloadStatus = !isError ? '✅ Saved: ${path.split('/').last}' : '❌ $path');
       Future.delayed(const Duration(seconds: 5), () {
         if (mounted) setState(() => _downloadStatus = '');
