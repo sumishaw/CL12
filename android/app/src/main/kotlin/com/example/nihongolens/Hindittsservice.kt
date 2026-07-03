@@ -852,8 +852,21 @@ object HindiTtsService {
         val tagged = words.mapIndexed { i, w ->
             val curveIdx = ((i.toFloat() / (words.size - 1).coerceAtLeast(1)) * (curve.size - 1))
                 .toInt().coerceIn(0, curve.size - 1)
-            val rawF0 = curve[curveIdx]
-            var deviationPct = if (rawF0 > 60f) ((rawF0 - meanF0) / meanF0 * 100f * 0.6f) else 0f
+            // REMOVED: per-word pitch deviation driven by the captured F0
+            // contour (was: (rawF0 - meanF0) / meanF0 * 100f * 0.6f). This
+            // made speech sound unnatural / like a different voice —
+            // partly because Android TTS's per-word SSML pitch tags have
+            // inherent robotic-staircase limits (documented elsewhere in
+            // this file), and partly because the ORIGINAL English audio's
+            // F0 shape doesn't correspond to anything meaningful when
+            // mapped onto a DIFFERENT-LENGTH, DIFFERENT-WORD-ORDER Hindi
+            // translation — word 3 in Hindi has no real relationship to
+            // word 3's pitch in the original English. The per-SENTENCE
+            // base pitch (finalPitch, matched to the measured speaker F0)
+            // is untouched — only this word-by-word curve-following is
+            // removed. Energy-based nudge and vibrato wobble below are
+            // separate, smaller mechanisms and are kept.
+            var deviationPct = 0f
 
             // Energy matching: words spoken louder than the sentence's own
             // average get a small extra pitch lift, quieter words a small
