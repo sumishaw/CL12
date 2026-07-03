@@ -349,6 +349,14 @@ object GenderAnalyzer {
     private var sustainedHighF0Frames = 0
     private var emotionFrameCount = 0
 
+    // Emotion smoothing (see the fix comment at the detectedEmotion
+    // application site for the full explanation) — same majority-vote +
+    // cooldown pattern already used for gender detection.
+    private val emotionHistory = ArrayDeque<HindiTtsService.Emotion>(5)
+    private const val EMOTION_HIST = 5   // ~5 cycles * 1.28s ≈ 6.4s window before a majority can form
+    private var lastEmotionSwitchMs = 0L
+    private const val MIN_EMOTION_SWITCH_INTERVAL_MS = 3_000L  // don't switch emotion more than once per 3s
+
     // ── Multi-point F0+RMS contour tracking ──────────────────────────────────
     // Captures 10 evenly-spaced F0 AND RMS samples across the sentence window.
     // F0 samples → per-word pitch variation (not just 3-point start/peak/end)
@@ -599,9 +607,30 @@ object GenderAnalyzer {
                 f0History.toList(), rmsHistory.toList(),
                 risingFrames, fallingFrames, highEnergyFrames, sustainedHighF0Frames, f0
             )
-            if (detectedEmotion != HindiTtsService.currentEmotion) {
-                HindiTtsService.currentEmotion = detectedEmotion
-                CaptionLogger.log(TAG, "EMO→$detectedEmotion F0=${f0.toInt()} slope=${f0Slope.toInt()}")
+
+            // FIX: previously applied detectedEmotion instantly every single
+            // cycle with zero smoothing — ordinary short-term acoustic
+            // fluctuation within a genuinely stable emotional state was
+            // enough to flip it on almost every cycle (~every 1.28s, often
+            // meaning a new "emotion" per sentence), not reflecting genuine
+            // change in the original video. Same fix pattern as gender
+            // detection: require a majority of a recent detection window to
+            // agree on a DIFFERENT emotion, plus a minimum time between
+            // actual switches, before the reported emotion actually changes.
+            emotionHistory.addLast(detectedEmotion)
+            if (emotionHistory.size > EMOTION_HIST) emotionHistory.removeFirst()
+
+            val counts = emotionHistory.groupingBy { it }.eachCount()
+            val majorityEmotion = counts.maxByOrNull { it.value }?.key ?: HindiTtsService.currentEmotion
+            val majorityCount = counts[majorityEmotion] ?: 0
+
+            val nowMsEmo = System.currentTimeMillis()
+            if (majorityEmotion != HindiTtsService.currentEmotion &&
+                majorityCount > emotionHistory.size / 2 &&
+                nowMsEmo - lastEmotionSwitchMs >= MIN_EMOTION_SWITCH_INTERVAL_MS) {
+                lastEmotionSwitchMs = nowMsEmo
+                HindiTtsService.currentEmotion = majorityEmotion
+                CaptionLogger.log(TAG, "EMO→$majorityEmotion F0=${f0.toInt()} slope=${f0Slope.toInt()}")
             }
             risingFrames = 0; fallingFrames = 0; highEnergyFrames = 0
         }
