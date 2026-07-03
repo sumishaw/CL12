@@ -150,6 +150,19 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       if (mounted) setState(() => hasOverlay = overlay);
     } catch (_) {}
     await _checkStoragePermission();
+    // FIX: previously hasAccessibility only ever flipped to true via a
+    // PASSIVE event fired when the accessibility service's own
+    // onServiceConnected() callback ran. Since Android's accessibility
+    // service is OS-managed and can keep running independently of the
+    // app's process, restarting the app while the service was still
+    // genuinely enabled meant that event might never re-fire this session
+    // — showing a false "not allowed" even though the permission was
+    // actually still granted. This actively queries the real current
+    // state instead of waiting for an event that may not come.
+    try {
+      final acc = await _ch.invokeMethod<bool>('checkAccessibilityEnabled') ?? false;
+      if (mounted) setState(() => hasAccessibility = acc);
+    } catch (_) {}
   }
 
   Future<void> _checkModelStatus() async {
