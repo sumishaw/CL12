@@ -373,7 +373,47 @@ object GenderAnalyzer {
     // Should only change when speaker genuinely changes, not on momentary noise
     private const val VOICE_TYPE_MIN_SWITCH_MS = 15_000L
 
-    private fun onPitch(f0: Float, rms: Float) {
+    // ── Octave-error correction / outlier rejection ───────────────────────────
+    // YIN pitch detection can occasionally lock onto the wrong harmonic,
+    // producing a reading roughly double or half the true F0 ("octave
+    // error") — a well-known failure mode for autocorrelation-based pitch
+    // trackers. This single bad reading corrupts BOTH downstream consumers
+    // at once: gender classification (a stray high reading briefly looks
+    // "female") and TTS pitch matching (a stray reading makes the
+    // synthesized voice's pitch jump between sentences — "sounds like a
+    // different person"). Checked against a short rolling median of recent
+    // readings: if the new value is roughly double or half that median,
+    // it's corrected back into range rather than passed through as-is; if
+    // it's too far off to be explained by a simple octave error, it's
+    // likely pure noise and this frame is discarded entirely (returns null).
+    private val recentF0ForOutlierCheck = ArrayDeque<Float>(7)
+
+    private fun correctOctaveErrorAndFilterOutliers(rawF0: Float): Float? {
+        if (rawF0 <= 0f) return null
+        if (recentF0ForOutlierCheck.size < 3) {
+            recentF0ForOutlierCheck.addLast(rawF0)
+            if (recentF0ForOutlierCheck.size > 7) recentF0ForOutlierCheck.removeFirst()
+            return rawF0  // not enough history yet to judge — accept as-is
+        }
+        val sorted = recentF0ForOutlierCheck.sorted()
+        val median = sorted[sorted.size / 2]
+        if (median <= 0f) return rawF0
+
+        val ratio = rawF0 / median
+        val corrected = when {
+            ratio > 1.8f && ratio < 2.2f  -> rawF0 / 2f   // likely octave-up error
+            ratio > 0.45f && ratio < 0.55f -> rawF0 * 2f  // likely octave-down error
+            ratio > 2.8f || ratio < 0.35f  -> return null  // too far off for a simple octave error — discard as noise
+            else -> rawF0
+        }
+
+        recentF0ForOutlierCheck.addLast(corrected)
+        if (recentF0ForOutlierCheck.size > 7) recentF0ForOutlierCheck.removeFirst()
+        return corrected
+    }
+
+    private fun onPitch(rawF0: Float, rms: Float) {
+        val f0 = correctOctaveErrorAndFilterOutliers(rawF0) ?: return
         frameCount++
         val gender = if (f0 >= F0_FEMALE) HindiTtsService.Gender.FEMALE
                      else                  HindiTtsService.Gender.MALE
