@@ -574,12 +574,18 @@ object HindiTtsService {
         val profileRate  = (ttsSpeedMultiplier * syllableRateMultiplier).coerceIn(0.5f, 2.0f)
 
         // Use voiceTextureEmotion if active and no other emotion detected
-        // Precedence: explicit acoustic emotion > detected singing > voice
-        // texture > neutral. Singing detection is a strong, specific signal
-        // (vibrato + pitch range + energy sustain) so it outranks the more
-        // generic voice-texture fallback, but an explicitly detected emotion
-        // (e.g. genuine EXCITED/ANGRY speech) still takes priority over it.
+        // Precedence: singing detection outranks the generic emotions most
+        // likely to be a FALSE-POSITIVE misclassification of the same
+        // singing audio — HAPPY/EXCITED/SURPRISED all key off rising/high
+        // pitch + high energy, which is exactly what singing also produces,
+        // so the generic classifier would very plausibly guess "EXCITED"
+        // for real singing and silently block the more specific, multi-
+        // signal singing detection every time. Genuinely distinct emotions
+        // (ANGRY, SAD, CRYING, etc.) are unlikely to be confused with
+        // singing's acoustic profile, so those still take priority over it.
+        val singingLikelyConfusedWith = setOf(Emotion.HAPPY, Emotion.EXCITED, Emotion.SURPRISED, Emotion.NEUTRAL)
         val effectiveEmotion = when {
+            capturedSingingDetected && currentEmotion in singingLikelyConfusedWith -> Emotion.SINGING
             currentEmotion != Emotion.NEUTRAL -> currentEmotion
             capturedSingingDetected           -> Emotion.SINGING
             voiceTextureEmotion != null       -> voiceTextureEmotion!!
