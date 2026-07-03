@@ -8,6 +8,7 @@ import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
@@ -71,6 +72,38 @@ class MainActivity : FlutterActivity() {
                             Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
                             Uri.parse("package:$packageName")
                         ))
+                        result.success(false)
+                    } else {
+                        result.success(true)
+                    }
+                }
+
+                // ── All-files-access storage permission ─────────────────────────
+                // MANAGE_EXTERNAL_STORAGE is declared in the manifest already, but
+                // unlike normal permissions it has NO runtime request dialog and
+                // does NOT appear in the regular grouped Permissions screen — it
+                // lives on its own dedicated per-app settings page, reachable only
+                // via this specific intent. Without this, there's no way for the
+                // user to find or grant it, which is exactly what was happening.
+                "hasManageStoragePermission" ->
+                    result.success(
+                        Build.VERSION.SDK_INT < Build.VERSION_CODES.R ||
+                        Environment.isExternalStorageManager()
+                    )
+
+                "requestManageStoragePermission" -> {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                        !Environment.isExternalStorageManager()) {
+                        try {
+                            startActivity(Intent(
+                                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                Uri.parse("package:$packageName")
+                            ))
+                        } catch (e: Exception) {
+                            // Some OEM skins don't resolve the per-app variant —
+                            // fall back to the general all-files-access list page
+                            startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                        }
                         result.success(false)
                     } else {
                         result.success(true)
