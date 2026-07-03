@@ -621,7 +621,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Future<void> _downloadLogs() async {
     try {
       final path = await _ch.invokeMethod<String>('downloadLogs') ?? '';
-      if (mounted) setState(() => _downloadStatus = path.isNotEmpty ? '✅ Saved: ${path.split('/').last}' : '❌ failed');
+      final isError = path.isEmpty || path.startsWith('Error:');
+      if (mounted) setState(() => _downloadStatus = !isError ? '✅ Saved: ${path.split('/').last}' : '❌ $path');
       Future.delayed(const Duration(seconds: 5), () {
         if (mounted) setState(() => _downloadStatus = '');
       });
