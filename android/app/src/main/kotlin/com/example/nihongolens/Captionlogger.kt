@@ -1,6 +1,7 @@
 package com.example.nihongolens
 
 import android.content.Context
+import android.os.Environment
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -136,25 +137,56 @@ object CaptionLogger {
 
     // ── Download to /storage/emulated/0/captionlog/ ───────────────────────────
 
+    // ── Download: try captionlog/, fall back to Downloads/ if it fails ────────
+    //
+    // /storage/emulated/0/captionlog is NOT one of Android's recognized public
+    // directories (unlike Downloads). On Android 10+ (scoped storage), raw
+    // File-based writes to an arbitrary new top-level folder require the app
+    // to hold MANAGE_EXTERNAL_STORAGE ("All files access") — without it,
+    // mkdirs()/writes there fail with ENOENT (folder never actually created)
+    // or EPERM (folder exists but write is blocked), confirmed in the field.
+    // Downloads/ works today because it has broader legacy/public-directory
+    // access — so it's the safety net: if captionlog/ fails for any reason,
+    // logs are saved there instead rather than being silently lost.
+
     @JvmStatic
-    fun downloadLogs(context: Context): String = try {
-        val fname = "captionlens_${dateFmt.format(Date())}.log"
-        val dir   = File("/storage/emulated/0/captionlog")
-        dir.mkdirs()
-        val file  = File(dir, fname)
+    fun downloadLogs(context: Context): String {
+        val fname  = "captionlens_${dateFmt.format(Date())}.log"
         val header = "=== Caption Lens Debug Log ===\n" +
             "Date: ${Date()}\n" +
             "Device: ${android.os.Build.MODEL} Android ${android.os.Build.VERSION.RELEASE}\n" +
             "Stats: ${getStats()}\n" +
             "=".repeat(60) + "\n\n"
-        file.writeText(header + getRecentLines())
-        log("Logger", "Saved: ${file.absolutePath}")
-        file.absolutePath
-    } catch (e: Exception) {
-        log("Logger", "Download failed: ${e.message}", LEVEL_ERROR)
-        "Error: ${e.message}"
+        val content = header + getRecentLines()
+
+        // Attempt 1: requested captionlog/ folder
+        try {
+            val dir = File("/storage/emulated/0/captionlog")
+            if (!dir.exists() && !dir.mkdirs()) {
+                throw java.io.IOException("mkdirs() returned false — likely missing All Files Access permission")
+            }
+            val file = File(dir, fname)
+            file.writeText(content)
+            log("Logger", "Saved: ${file.absolutePath}")
+            return file.absolutePath
+        } catch (e: Exception) {
+            log("Logger", "captionlog/ save failed (${e.message}) — falling back to Downloads/", LEVEL_WARN)
+        }
+
+        // Attempt 2: fallback to Downloads/ — the path already proven to work
+        return try {
+            val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            dir.mkdirs()
+            val file = File(dir, fname)
+            file.writeText(content)
+            log("Logger", "Saved (fallback): ${file.absolutePath}")
+            file.absolutePath
+        } catch (e: Exception) {
+            log("Logger", "Download failed on both paths: ${e.message}", LEVEL_ERROR)
+            "Error: ${e.message}"
+        }
     }
 
     @JvmStatic
-    fun getLogPath(): String = "/storage/emulated/0/captionlog/captionlens_*.log"
+    fun getLogPath(): String = "/storage/emulated/0/captionlog/ (or Downloads/ if that's unavailable) — captionlens_*.log"
 }
