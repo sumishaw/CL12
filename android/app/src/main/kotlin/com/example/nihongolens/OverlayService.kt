@@ -74,7 +74,12 @@ class OverlayService : Service() {
         // stops rendering text (View.GONE) but keeps tracking latestHindi
         // internally — flip it back to false and the current text reappears
         // immediately, no need to wait for the next translated sentence.
-        fun setSubtitleHidden(hidden: Boolean) {
+        // NOTE: named applySubtitleHidden, NOT setSubtitleHidden — Kotlin's
+        // `var subtitleHidden` above already auto-generates a JVM setter
+        // called setSubtitleHidden(Boolean); a function with that exact same
+        // name is a "platform declaration clash" (two declarations compiling
+        // to the identical JVM signature) and fails the build.
+        fun applySubtitleHidden(hidden: Boolean) {
             subtitleHidden = hidden
             instance?.handler?.post { instance?.applyHiddenState() }
         }
