@@ -664,6 +664,41 @@ class LiveCaptionReader : AccessibilityService() {
             return
         }
 
+        // ── RULE 1b: CAPITALIZATION SENTENCE-START (Latin-script only) ────────
+        // Some languages (English, French, German, Spanish, etc.) conventionally
+        // capitalize the first word of a new sentence. If a NEW capitalized
+        // word appears partway through the currently-buffered untranslated
+        // tail, that's a strong signal the text BEFORE it was actually a
+        // complete sentence — even without terminal punctuation (LC
+        // sometimes drops punctuation, or runs two sentences together).
+        // Deliberately conservative: only applies to Latin-script text
+        // (most languages have no capitalization convention at all — Hindi,
+        // Chinese, Arabic, etc. — where this signal would be meaningless or
+        // actively wrong), skips "I"/"I'm" (always capitalized regardless
+        // of position), skips ALL-CAPS words (likely acronyms, not sentence
+        // starts), and only fires once the pre-capital portion is already a
+        // reasonable length (avoids splitting on short fragments where a
+        // capitalized proper noun could appear early in a genuine sentence).
+        if (isLatinScriptText(untranslated)) {
+            val tailWords = untranslated.split(" ")
+            for (idx in 1 until tailWords.size) {
+                val w = tailWords[idx]
+                if (looksLikeSentenceStart(w)) {
+                    val before = tailWords.subList(0, idx).joinToString(" ").trim()
+                    if (wc(before) >= 4 && before != lastEnqueuedText) {
+                        sentenceTimerJob?.cancel(); pendingJob?.cancel()
+                        val beforeTotalWords = lastSubmitTotalWords + wc(before)
+                        pendingJob = scope.launch {
+                            delay(80)
+                            CaptionLogger.log(TAG, "CAP-START before='...${before.takeLast(20)}' next='$w' wc=${wc(before)}")
+                            doSubmit(before, beforeTotalWords)
+                        }
+                        return
+                    }
+                }
+            }
+        }
+
         // ── RULE 2: SOFT clause-end — wait for more ───────────────────────────
         if (lastChar in SOFT_END_CHARS && newWords >= 8) {
             sentenceTimerJob?.cancel(); pendingJob?.cancel()
@@ -938,6 +973,33 @@ class LiveCaptionReader : AccessibilityService() {
         val lastWord = text.trim().trimEnd('.', '!', '?', ',', ';', ':')
             .substringAfterLast(' ').lowercase()
         return lastWord in DANGLING_WORDS
+    }
+
+    // Used by RULE 1b (capitalization sentence-start signal). Checks
+    // whether text is predominantly Latin-script (English, French, German,
+    // Spanish, etc.) — languages without case distinction (Hindi, Chinese,
+    // Arabic, Japanese, ...) don't have a capitalization convention for
+    // sentence starts at all, so this signal must not apply to them.
+    private fun isLatinScriptText(text: String): Boolean {
+        val letters = text.filter { it.isLetter() }
+        if (letters.isEmpty()) return false
+        val latinCount = letters.count { it.code in 0x0041..0x005A || it.code in 0x0061..0x007A }
+        return latinCount.toFloat() / letters.length > 0.7f
+    }
+
+    // Conservative check for "this word looks like it starts a new
+    // sentence." Excludes "I"/"I'm"/"I've" etc. (always capitalized
+    // regardless of sentence position) and ALL-CAPS words (likely
+    // acronyms like "NASA"/"USA", not sentence starts) — both are common
+    // false-positive sources for a naive "starts with capital" check.
+    private fun looksLikeSentenceStart(word: String): Boolean {
+        val clean = word.trim().trimStart('"', '\'', '(', '[')
+        if (clean.length < 2) return false
+        if (!clean[0].isUpperCase()) return false
+        if (clean == "I" || clean.startsWith("I'")) return false
+        val lettersOnly = clean.filter { it.isLetter() }
+        if (lettersOnly.length > 1 && lettersOnly.all { it.isUpperCase() }) return false
+        return true
     }
 
     private fun isCompleteSentence(text: String): Boolean {
