@@ -28,7 +28,22 @@ object GenderAnalyzer {
     private const val TAG          = "GenderAnalyzer"
     private const val SR           = 16_000
     private const val WIN          = 2048        // 128ms window
-    private const val F0_FEMALE    = 165f        // Hz — above = female
+    // FIX: replaced the single hard threshold with hysteresis (a Schmitt-
+    // trigger pattern). Real male/female F0 ranges genuinely overlap —
+    // male speakers commonly reach 165-180Hz, female speakers commonly
+    // reach down to 165-180Hz too. A single fixed threshold sitting inside
+    // that overlap means a borderline-pitched speaker's natural pitch
+    // variation crosses it constantly, regardless of how much time-based
+    // smoothing (decimation, switch cooldown) sits on top — those solve
+    // "how fast can it switch," not "is a switch justified at all." This is
+    // the actual fix for continuous switching: F0_FEMALE_UP requires F0 to
+    // CLEARLY be in female range to vote female; F0_MALE_DOWN requires F0 to
+    // CLEARLY be in male range to vote male. Inside the 150-180Hz gap
+    // between them, the vote reinforces whichever gender is ALREADY
+    // detected rather than picking a side — ambiguous readings no longer
+    // count as evidence for a change at all.
+    private const val F0_FEMALE_UP  = 180f   // Hz — must clearly exceed this to vote FEMALE
+    private const val F0_MALE_DOWN  = 150f   // Hz — must clearly drop below this to vote MALE
     private const val YIN_THRESH   = 0.25f       // stricter threshold for clean internal audio
     private const val RMS_FLOOR    = 80f         // out of 32768 — skip silence
 
@@ -415,8 +430,18 @@ object GenderAnalyzer {
     private fun onPitch(rawF0: Float, rms: Float) {
         val f0 = correctOctaveErrorAndFilterOutliers(rawF0) ?: return
         frameCount++
-        val gender = if (f0 >= F0_FEMALE) HindiTtsService.Gender.FEMALE
-                     else                  HindiTtsService.Gender.MALE
+        // Hysteresis: only a CLEAR reading in either direction votes for
+        // that gender. A reading in the 150-180Hz ambiguous gap reinforces
+        // whichever gender is already detected — it is NOT evidence for a
+        // change, since it's equally consistent with either gender's
+        // natural range. This is what actually stops continuous switching
+        // for a borderline-pitched speaker; time-based smoothing alone
+        // can't fix a threshold sitting inside the real overlap zone.
+        val gender = when {
+            f0 >= F0_FEMALE_UP -> HindiTtsService.Gender.FEMALE
+            f0 <  F0_MALE_DOWN -> HindiTtsService.Gender.MALE
+            else               -> HindiTtsService.detectedGender
+        }
 
         if (frameCount % 32 == 0)  // was % 5 @ 128ms cadence; 32 @ 20ms keeps the same ~640ms interval
             CaptionLogger.log(TAG, "PITCH F0=${f0.toInt()}Hz rms=${rms.toInt()} → $gender")
