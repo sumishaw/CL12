@@ -29,16 +29,13 @@ class LiveCaptionReader : AccessibilityService() {
         private const val TRANSLATE_URL      = "http://127.0.0.1:8765/translate_text"
         private const val IS_COMPLETE_URL    = "http://127.0.0.1:8765/is_complete"
         private const val CONNECT_TIMEOUT  = 3_000
-        // FIX: was 6_000. This is the exact value that caused ~87% of real
-        // translations to fail when NLLB was previously tried as primary —
-        // the server's own NLLB timeout (15s, see whisper_server.py) was
-        // LONGER than this client timeout, so the client gave up and logged
-        // a failure before the server could even finish, let alone fall
-        // through to a fallback. Increased to comfortably exceed the
-        // server's NLLB budget. This is a deliberate quality-over-latency
-        // tradeoff, chosen explicitly — captions/audio will now visibly lag
-        // further behind the source video than before.
-        private const val READ_TIMEOUT     = 16_000
+        // Reverted from 16_000 — that was tuned specifically to accommodate
+        // NLLB as primary, which has now failed twice under real concurrent
+        // load (see whisper_server.py's translate_to_hindi() for the full
+        // explanation). CT2 opus-mt (primary again) completes in ~100ms —
+        // 6s leaves comfortable headroom for genuine network hiccups
+        // without waiting out a fundamentally too-slow model.
+        private const val READ_TIMEOUT     = 6_000
         private const val DEBOUNCE_MS      = 400L
         private const val WATCHDOG_MS      = 2_000L
         private const val STARTUP_GRACE_MS = 1_000L
