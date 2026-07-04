@@ -343,6 +343,15 @@ object HindiTtsService {
     private val pendingUtterances = ConcurrentHashMap<String, () -> Unit>()
 
     // ── FIFO queues ───────────────────────────────────────────────────────────
+    // Monotonically increasing sequence token, assigned once per sentence at
+    // enqueue time in speak(). Used to detect duplicate submissions (same
+    // seq processed twice) and out-of-order playback (a seq arriving lower
+    // than the last one played) — both logged loudly if they ever happen,
+    // since either would indicate a real race condition worth investigating
+    // further, not something to silently paper over.
+    private val nextSeq = java.util.concurrent.atomic.AtomicLong(0)
+    private var lastPlayedSeq = -1L
+
     data class FetchItem(
         val text: String,
         val gender: String,
@@ -351,9 +360,10 @@ object HindiTtsService {
         val srcText: String = "",
         val emotion: Emotion = Emotion.NEUTRAL,
         val bgSeq: Int = 0,
-        val enqMs: Long = System.currentTimeMillis()
+        val enqMs: Long = System.currentTimeMillis(),
+        val seq: Long = 0
     )
-    data class PlayItem(val text: String, val wavFile: File, val durMs: Long)
+    data class PlayItem(val text: String, val wavFile: File, val durMs: Long, val seq: Long = 0)
 
     private val fetchQueue = LinkedBlockingQueue<FetchItem>()
     private val playQueue  = LinkedBlockingQueue<PlayItem>()
@@ -385,6 +395,14 @@ object HindiTtsService {
     private const val MAX_PLAY_BACKLOG_MS = 8_000L
 
     private fun offerToPlayQueue(item: PlayItem) {
+        // Dedup: a seq lower than or equal to what's already been played
+        // means this exact sentence was somehow submitted/synthesized twice
+        // — reject it rather than play it again.
+        if (item.seq <= lastPlayedSeq) {
+            CaptionLogger.log(TAG, "PLAY-DUPLICATE-REJECTED seq=${item.seq} (already played up to seq=$lastPlayedSeq) '${item.text.take(30)}'")
+            try { item.wavFile.delete() } catch (_: Exception) {}
+            return
+        }
         playQueue.offer(item)
         // LinkedBlockingQueue's iterator is weakly-consistent — safe to sum
         // concurrently with the play worker's take(), at worst slightly
@@ -640,8 +658,9 @@ object HindiTtsService {
         // template dispatch in emotionSsml(), which reads item.emotion.
         // Singing detection would have computed correctly but never actually
         // routed to buildSingingContour(). Now it does.
+        val mySeq = nextSeq.getAndIncrement()
         fetchQueue.offer(FetchItem(n, genderTag, blendedPitch, blendedRate, srcText,
-            effectiveEmotion, bgSeq, System.currentTimeMillis()))
+            effectiveEmotion, bgSeq, System.currentTimeMillis(), mySeq))
     }
 
     // ── Fetch worker: Android TTS → WAV file ──────────────────────────────────
@@ -679,8 +698,8 @@ object HindiTtsService {
                 val durMs = if (fileSize > 44) ((fileSize - 44) * 1000L) / (sr * 2L) else 2000L
                 val mixedFile = mixBgMusic(wavFile, item.bgSeq) ?: wavFile
 
-                CaptionLogger.log(TAG, "TTS-WAV[$workerName] ${ms}ms ${durMs}ms bg=${item.bgSeq} '${textToSpeak.take(40)}'")
-                offerToPlayQueue(PlayItem(textToSpeak, mixedFile, durMs))
+                CaptionLogger.log(TAG, "TTS-WAV[$workerName] seq=${item.seq} ${ms}ms ${durMs}ms bg=${item.bgSeq} '${textToSpeak.take(40)}'")
+                offerToPlayQueue(PlayItem(textToSpeak, mixedFile, durMs, item.seq))
             } catch (e: CancellationException) {
                 throw e  // let real cancellation (session stop) propagate normally
             } catch (e: Exception) {
@@ -1525,9 +1544,18 @@ object HindiTtsService {
             while (isActive) {
                 val item = playQueue.take()
                 if (!enabled) { item.wavFile.delete(); continue }
+                // Diagnostic: this queue is single-consumer FIFO, so this
+                // should never actually fire — if it does, that's real
+                // evidence of an out-of-order race condition somewhere
+                // upstream worth investigating, not something to silently
+                // let slide.
+                if (item.seq < lastPlayedSeq) {
+                    CaptionLogger.log(TAG, "PLAY-OUT-OF-ORDER seq=${item.seq} arrived after seq=$lastPlayedSeq already played — investigate upstream race")
+                }
+                lastPlayedSeq = item.seq
                 try {
                     isSpeaking = true
-                    CaptionLogger.log(TAG, "PLAY ${item.durMs}ms '${item.text.take(40)}'")
+                    CaptionLogger.log(TAG, "PLAY seq=${item.seq} ${item.durMs}ms '${item.text.take(40)}'")
                     // Subtitle is now shown by deliverHindi() immediately when translation arrives.
                     // Play worker only handles audio — no longer controls overlay display.
                     // This decouples subtitle speed (CT2 ~0.8s) from audio speed (TTS ~1s).
