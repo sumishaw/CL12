@@ -29,7 +29,16 @@ class LiveCaptionReader : AccessibilityService() {
         private const val TRANSLATE_URL      = "http://127.0.0.1:8765/translate_text"
         private const val IS_COMPLETE_URL    = "http://127.0.0.1:8765/is_complete"
         private const val CONNECT_TIMEOUT  = 3_000
-        private const val READ_TIMEOUT     = 6_000
+        // FIX: was 6_000. This is the exact value that caused ~87% of real
+        // translations to fail when NLLB was previously tried as primary —
+        // the server's own NLLB timeout (15s, see whisper_server.py) was
+        // LONGER than this client timeout, so the client gave up and logged
+        // a failure before the server could even finish, let alone fall
+        // through to a fallback. Increased to comfortably exceed the
+        // server's NLLB budget. This is a deliberate quality-over-latency
+        // tradeoff, chosen explicitly — captions/audio will now visibly lag
+        // further behind the source video than before.
+        private const val READ_TIMEOUT     = 16_000
         private const val DEBOUNCE_MS      = 400L
         private const val WATCHDOG_MS      = 2_000L
         private const val STARTUP_GRACE_MS = 1_000L
@@ -135,13 +144,24 @@ class LiveCaptionReader : AccessibilityService() {
         // FORCE every 6 words = 10 submissions of the same sentence → CT2 flood.
         // Match server chunk size: 12 words per CT2 call → ~1.2s per chunk
         // Previously 20 words → 2.5s per chunk → 5-chunk paragraph = 12.5s backlog
-        private const val MAX_WORDS_BEFORE_FORCE = 10  // match 10-word server chunk
+        // FIX: was 10, with a comment claiming it needs to "match 10-word
+        // server chunk" — but that's conflating two unrelated things. The
+        // server's TTS chunking splits ALREADY-TRANSLATED Hindi text for
+        // streaming playback; this constant decides when to submit ENGLISH
+        // text for translation in the first place. There's no real reason
+        // for one to match the other, and forcing a cut at exactly 10 words
+        // regardless of grammatical structure is what was cutting sentences
+        // mid-clause ("and then for interest or for debt that is less
+        // than..." genuinely needs more than 10 words to reach a natural
+        // break) — producing garbled, meaning-losing Hindi translations.
+        // Restored to match this rule's own original stated purpose.
+        private const val MAX_WORDS_BEFORE_FORCE = 20  // 20+ new untranslated words — was wrongly dropped to 10
 
         // FORCE_MIN_NEW_WORDS: raised 6→12. Previously wordsSinceSubmit=7 bypassed
         // cooldown, causing same text to be submitted every 7 words (3s = 1+ per second).
         // After FORCE, need 6 new words before next FORCE (was 12)
         // With 12-word chunks: 6 new words = speaker said half a chunk = safe to re-submit
-        private const val FORCE_MIN_NEW_WORDS = 5   // half of 10-word chunk
+        private const val FORCE_MIN_NEW_WORDS = 10   // half of 20-word chunk (was 5, half of the mistaken 10)
 
         // FORCE_COOLDOWN_MS: hard time-based lock after any FORCE submission.
         // Even if 12 new words arrive in 1 second, don't force-submit again.
