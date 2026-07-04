@@ -752,44 +752,17 @@ class LiveCaptionReader : AccessibilityService() {
             return
         }
 
-        // ── RULE 4: SMART SILENCE GAP ────────────────────────────────────────
-        // Uses isCompleteSentence() (local dangling-word check + /is_complete
-        // network check, see that function) to decide silence duration:
-        //   Complete sentence (e.g. "Funny, I'm so sorry.") → 500ms wait
-        //   Incomplete fragment (e.g. "But the end of") → 1600ms wait
-        // This prevents flooding CT2 with tiny mid-sentence fragments from
-        // rapid dialogue, AND — this is the important part for translation
-        // grammar — gives a genuinely incomplete fragment real extra time
-        // for the rest of the clause to arrive before firing anyway, rather
-        // than translating "I am going" and "to the store" as two separate,
-        // un-reorderable CT2 calls. Still bounded: if the speaker really did
-        // stop (trailed off, interrupted), it fires after the wait either way
-        // — this delays incomplete fragments, it doesn't block them forever.
-        sentenceTimerJob?.cancel(); pendingJob?.cancel()
-        if (newWords >= 3) {
-            sentenceTimerJob = scope.launch {
-                val t = sentenceBuffer.trim()
-                // FIX: previously skipped the completeness check entirely
-                // for 10+ word text, assuming length alone meant it was safe
-                // to fire fast — but a long fragment can still end mid-clause
-                // ("...was because of the fact that the weather conditions
-                // were extremely") just as easily as a short one.
-                val complete = withContext(Dispatchers.IO) { isCompleteSentence(t) }
-                val silenceMs = if (complete) {
-                    CaptionLogger.log(TAG, "SMART-COMPLETE wc=${wc(t)} — fast silence 500ms")
-                    500L
-                } else {
-                    CaptionLogger.log(TAG, "SMART-INCOMPLETE wc=${wc(t)} — silence 1600ms (was 700ms — too little buffer for the rest of the clause to arrive)")
-                    1600L
-                }
-                delay(silenceMs)
-                val t2 = sentenceBuffer.trim()
-                if (t2.isNotBlank() && t2 != lastEnqueuedText && wc(t2) >= 3) {
-                    CaptionLogger.log(TAG, "SMART-SILENCE ${silenceMs}ms wc=${wc(t2)}")
-                    doSubmit(t2, totalWords)
-                }
-            }
-        }
+        // RULE 4 (SMART SILENCE GAP) removed — was a time-based heuristic
+        // trigger using isCompleteSentence() to pick a variable delay before
+        // firing. Removed per explicit request: its delayed coroutine could
+        // race against the other rules' own timers (RULE 2's SOFT-END,
+        // RULE 3's FORCE, the COOLDOWN gate above), all sharing the same
+        // sentenceTimerJob/pendingJob references — contributing to dropped
+        // and repeated sentences. Only structural triggers remain now:
+        // RULE 1 (hard punctuation), RULE 1b (capitalization), RULE 2 (soft
+        // punctuation), RULE 3 (force at word-count). If none of those fire,
+        // text simply stays buffered until the next schedule() call brings
+        // more words or punctuation — no more heuristic-timed submission.
     }
 
     private fun doSubmit(text: String, currentTotalWords: Int) {
