@@ -378,17 +378,11 @@ object HindiTtsService {
     // sentences will now be silently skipped during a genuine backlog
     // instead of playing minutes late.
     //
-    // FIX: raised from 8s to 20s to accommodate NLLB (now primary,
-    // deliberately chosen for quality over opus-mt's speed) taking up to
-    // ~15s per translation under real concurrent load. The old 8s cap was
-    // tuned for opus-mt's ~100ms turnaround — keeping it at 8s here would
-    // have meant NLLB's slower-but-better translations got silently
-    // discarded by this exact mechanism before they were ever spoken,
-    // defeating the whole point of switching to NLLB. This does mean
-    // audio can now lag up to ~20s behind the source video during genuine
-    // backlog — a deliberate, explicit part of this quality-over-latency
-    // tradeoff, not an oversight.
-    private const val MAX_PLAY_BACKLOG_MS = 20_000L
+    // Reverted from 20s back to 8s — the 20s value was specifically tuned
+    // to accommodate NLLB as primary, which has now failed twice under
+    // real concurrent load (see whisper_server.py's translate_to_hindi()).
+    // 8s matches CT2 opus-mt's actual fast turnaround as primary again.
+    private const val MAX_PLAY_BACKLOG_MS = 8_000L
 
     private fun offerToPlayQueue(item: PlayItem) {
         playQueue.offer(item)
