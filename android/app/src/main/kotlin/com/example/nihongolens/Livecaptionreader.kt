@@ -153,6 +153,11 @@ class LiveCaptionReader : AccessibilityService() {
         // break) — producing garbled, meaning-losing Hindi translations.
         // Restored to match this rule's own original stated purpose.
         private const val MAX_WORDS_BEFORE_FORCE = 20  // 20+ new untranslated words — was wrongly dropped to 10
+        // Absolute ceiling — forces regardless of grammatical safety once
+        // reached, so buffering never grows unbounded if a safe boundary
+        // never comes. Gives 15 words of "grace" beyond MAX_WORDS_BEFORE_FORCE
+        // for the dangling-word check to find a genuinely safer cut point.
+        private const val MAX_WORDS_HARD_CEILING = 35
 
         // FORCE_MIN_NEW_WORDS: raised 6→12. Previously wordsSinceSubmit=7 bypassed
         // cooldown, causing same text to be submitted every 7 words (3s = 1+ per second).
@@ -751,22 +756,40 @@ class LiveCaptionReader : AccessibilityService() {
         //   a) 20+ new untranslated words (was 15 — too low for 60-word paragraphs)
         //   b) 12+ new total words since last FORCE AND 5s since last FORCE
         // This dual gate prevents the "same sentence submitted 10 times" cascade.
+        //
+        // FIX: previously fired at EXACTLY MAX_WORDS_BEFORE_FORCE (20) words
+        // regardless of whether that was a safe grammatical boundary —
+        // confirmed in the field cutting mid-clause ("...that makes",
+        // "...level of psych[ology]"). Now checks the same local
+        // dangling-word heuristic already used elsewhere (a sentence
+        // ending on a preposition/conjunction/article/bare auxiliary verb
+        // is almost never actually complete) before forcing. If it's still
+        // unsafe, the threshold extends up to MAX_WORDS_HARD_CEILING,
+        // giving genuinely long sentences real room to reach a safer point
+        // — but still forcing eventually regardless, so buffering never
+        // grows unbounded if a safe point never comes.
         val timeSinceForce = System.currentTimeMillis() - lastForcedMs
         if (newWords >= MAX_WORDS_BEFORE_FORCE &&
             wordsSinceSubmit >= FORCE_MIN_NEW_WORDS &&
             timeSinceForce  >= FORCE_COOLDOWN_MS) {
-            sentenceTimerJob?.cancel(); pendingJob?.cancel()
             val t = sentenceBuffer.trim()
-            if (t.isNotBlank() && t != lastEnqueuedText && wc(t) >= MIN_WORDS_SILENCE) {
-                lastForcedMs = System.currentTimeMillis()
-                reserveSubmission(t, totalWords)
-                pendingJob = scope.launch {
-                    delay(150)
-                    CaptionLogger.log(TAG, "FORCE wc=${wc(t)} new=$wordsSinceSubmit")
-                    enqueue(t)
+            val isSafeToForce = !endsWithDanglingWord(t)
+            if (isSafeToForce || newWords >= MAX_WORDS_HARD_CEILING) {
+                sentenceTimerJob?.cancel(); pendingJob?.cancel()
+                if (t.isNotBlank() && t != lastEnqueuedText && wc(t) >= MIN_WORDS_SILENCE) {
+                    lastForcedMs = System.currentTimeMillis()
+                    reserveSubmission(t, totalWords)
+                    pendingJob = scope.launch {
+                        delay(150)
+                        CaptionLogger.log(TAG, "FORCE wc=${wc(t)} new=$wordsSinceSubmit safe=$isSafeToForce")
+                        enqueue(t)
+                    }
                 }
+                return
             }
-            return
+            // else: not yet at a safe boundary and still under the hard
+            // ceiling — fall through and let more words accumulate before
+            // re-checking on the next schedule() call.
         }
 
         // RULE 4 (SMART SILENCE GAP) removed — was a time-based heuristic
