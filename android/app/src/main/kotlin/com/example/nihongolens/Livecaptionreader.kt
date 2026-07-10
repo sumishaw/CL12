@@ -36,6 +36,13 @@ class LiveCaptionReader : AccessibilityService() {
         // 6s leaves comfortable headroom for genuine network hiccups
         // without waiting out a fundamentally too-slow model.
         private const val READ_TIMEOUT     = 6_000
+        // Moderately longer budget for non-English content specifically —
+        // "a little delay," not unlimited waiting. Gives the CT2 pivot
+        // chain (source→English→Hindi, two lightweight translation calls)
+        // real room to complete under this device's real concurrent load,
+        // per explicit request after confirming this is a genuine hardware
+        // capacity ceiling, not a bug.
+        private const val READ_TIMEOUT_NON_ENGLISH = 14_000
         private const val DEBOUNCE_MS      = 400L
         private const val WATCHDOG_MS      = 2_000L
         private const val STARTUP_GRACE_MS = 1_000L
@@ -1224,8 +1231,20 @@ class LiveCaptionReader : AccessibilityService() {
             conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
             conn.doOutput       = true
             conn.connectTimeout = CONNECT_TIMEOUT
-            // CRITICAL FIX: 6s read timeout (was 35s)
-            conn.readTimeout    = READ_TIMEOUT
+            // FIX: was a single fixed READ_TIMEOUT (6s) for every request,
+            // English or not. Confirmed across multiple field tests that
+            // non-English translation (CT2 pivot chain: source→English,
+            // then English→Hindi) genuinely needs more time under this
+            // device's real concurrent load (Whisper + GenderAnalyzer +
+            // BGMusic all competing for the same 2 CPU cores) — this is a
+            // hardware capacity ceiling, not a bug, confirmed by testing
+            // LibreTranslate at three different timeout budgets and the
+            // CT2 pivot chain, all failing at the same ~6s mark. English
+            // stays at the existing fast timeout (proven ~100ms, no reason
+            // to wait longer); non-English gets a moderately longer
+            // budget — a real increase in patience, not unlimited waiting.
+            val isEnglish = confirmedLang.isEmpty() || confirmedLang == "latin_en"
+            conn.readTimeout = if (isEnglish) READ_TIMEOUT else READ_TIMEOUT_NON_ENGLISH
             val body = """{"text":${JSONObject.quote(text)},"src":"auto","tgt":"hi"}"""
             conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
             if (conn.responseCode != 200) {
