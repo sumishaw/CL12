@@ -431,12 +431,23 @@ class MainActivity : FlutterActivity() {
                 android.util.Log.d("MainActivity", "TTS auto-enabled on LC connect")
             }
 
-            // FIX BUG 2: Start BackgroundMusicRecorder for BG music capture + mixing
-            // Captures USAGE_MEDIA at 44100Hz stereo → indexed chunks → mixed into TTS audio
-            if (!BackgroundMusicRecorder.enabled) {
-                BackgroundMusicRecorder.start(lcProjection)
-                android.util.Log.d("MainActivity", "BackgroundMusicRecorder started on LC connect")
-            }
+            // DISABLED per explicit request: BackgroundMusicRecorder runs a
+            // separate, continuous 44.1kHz stereo audio capture (5.5x more
+            // raw audio data per second than GenderAnalyzer's 16kHz mono
+            // capture) plus an HTTP upload every ~2 seconds — a real,
+            // ongoing resource cost on top of Whisper + GenderAnalyzer +
+            // translation all already competing for this device's limited
+            // CPU. Disabled to free that budget for translation
+            // quality/speed. GenderAnalyzer is deliberately left untouched.
+            // Trade-off: Hindi audio plays without the original video's
+            // background music/ambience mixed underneath — mixBgMusic()
+            // already safely falls back to plain TTS audio when no BG data
+            // is available, so this doesn't break anything, it's a real,
+            // visible feature being turned off.
+            // if (!BackgroundMusicRecorder.enabled) {
+            //     BackgroundMusicRecorder.start(lcProjection)
+            //     android.util.Log.d("MainActivity", "BackgroundMusicRecorder started on LC connect")
+            // }
 
             if (OverlayService.instance == null && Settings.canDrawOverlays(this@MainActivity)) {
                 startForegroundServiceCompat(Intent(this@MainActivity, OverlayService::class.java))
